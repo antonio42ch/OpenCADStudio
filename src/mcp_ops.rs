@@ -870,7 +870,7 @@ pub static STOP: OpDef = OpDef {
 
 pub static GRAPH_APPLY: OpDef = OpDef {
     name: "graph_apply",
-    doc: "Edit the node graph: a list of changes applied all-or-nothing as one graph undo step, then evaluated once. Each change names one action: add (node type from graph_library, optional name, values for inputs, after, group, source to tell object from builtin), remove, rename (to), set (input value), link (Node.port) to (Node.port), unlink, move (after: \"start\" or a node), group (nodes, name), ungroup, duplicate, adopt (entity handle), clear. Values flow only forward along the node sequence and are typed only in Inputs-area nodes; remove and move that would drop links need force: true. Read guide node-graph first.",
+    doc: "Edit the node graph: a list of changes applied all-or-nothing as one graph undo step, then evaluated once. Each change names one action: add (node type from graph_library, optional name, values for inputs, after, group, source to tell object from builtin), remove, rename (to), set (input value), link (Node.port) to (Node.port), unlink, move (after: \"start\" or a node), group (nodes, name), ungroup, duplicate, adopt (entity handle), clear, composite (steps, name: one composite node), expand (composite back into its steps), save_composite (to the library; add one back with add: {\"composite\": name}). Values flow only forward along the node sequence and are typed only in Inputs-area nodes; remove and move that would drop links need force: true. Read guide node-graph first.",
     batchable: true,
     params: &[
         req(

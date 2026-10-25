@@ -35,6 +35,9 @@ const VERBS: &[&str] = &[
     "duplicate",
     "adopt",
     "clear",
+    "composite",
+    "expand",
+    "save_composite",
 ];
 
 /// A refused change.
@@ -128,6 +131,8 @@ pub(crate) struct Report {
     pub duplicated: Vec<(NodeId, NodeId)>,
     /// Entities of removed nodes.
     pub removed: Vec<Handle>,
+    /// Composites to save to the library once the request succeeds.
+    pub saved: Vec<std::sync::Arc<graph::Composite>>,
 }
 
 impl Report {
@@ -194,13 +199,7 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
                         label: (*name).to_owned(),
                         input: false,
                         output: true,
-                        kind: match *name {
-                            "curve" | "curves" => Expect::Curve,
-                            "point" | "vector" | "origin" | "x_axis" | "y_axis" | "normal"
-                            | "start" | "end" => Expect::Point,
-                            "plane" => Expect::Plane,
-                            _ => Expect::Any,
-                        },
+                        kind: output_kind(name),
                     }),
             );
             fields
@@ -208,6 +207,38 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
         Kind::Object(name) => ObjectKind::from_name(name)
             .map(|kind| drawing.fields(kind))
             .unwrap_or_default(),
+        Kind::Composite(composite) => composite_ports(composite),
+    }
+}
+
+/// A composite's exposed ports, typed as the inner ports they stand for.
+pub(crate) fn composite_ports(composite: &graph::Composite) -> Vec<Field> {
+    let inputs = composite.inputs.iter().map(|(name, _)| Field {
+        name: name.clone(),
+        label: name.clone(),
+        input: true,
+        output: false,
+        kind: crate::ui::node_graph::composite_expect(composite, name),
+    });
+    let outputs = composite.outputs.iter().map(|(name, port)| Field {
+        name: name.clone(),
+        label: name.clone(),
+        input: false,
+        output: true,
+        kind: output_kind(&port.field),
+    });
+    inputs.chain(outputs).collect()
+}
+
+/// The kind an operation output holds, by its name.
+fn output_kind(name: &str) -> Expect {
+    match name {
+        "curve" | "curves" => Expect::Curve,
+        "point" | "vector" | "origin" | "x_axis" | "y_axis" | "normal" | "start" | "end" => {
+            Expect::Point
+        }
+        "plane" => Expect::Plane,
+        _ => Expect::Any,
     }
 }
 
@@ -536,23 +567,39 @@ fn apply_one(
                 (PaletteItem::Object(drawing.entity(handle)?), vec![handle])
             } else {
                 let ty = &change["add"];
-                if ty.get("script").is_some() || ty.get("composite").is_some() {
+                if ty.get("script").is_some() {
                     return Err(fail_hint(
                         "not_supported",
-                        "Script and composite nodes are not available yet",
+                        "Script nodes are not available yet",
                         "Use node types from graph_library",
                     ));
                 }
-                let name = ty
-                    .as_str()
-                    .ok_or_else(|| fail("invalid_change", "add names a node type"))?;
-                let item = resolve_type(name, change["source"].as_str())?;
-                (item, Vec::new())
+                if let Some(wanted) = ty.get("composite") {
+                    let name = wanted.as_str().unwrap_or_default();
+                    let library = crate::ui::node_graph::composite_library();
+                    let k = library
+                        .iter()
+                        .position(|composite| {
+                            composite.name.to_lowercase() == name.trim().to_lowercase()
+                        })
+                        .ok_or_else(|| {
+                            fail_hint(
+                                "unknown_type",
+                                format!("The composite library has no {name}"),
+                                "Read graph_library with search: composite",
+                            )
+                        })?;
+                    (PaletteItem::Composite(k), Vec::new())
+                } else {
+                    let name = ty
+                        .as_str()
+                        .ok_or_else(|| fail("invalid_change", "add names a node type"))?;
+                    (resolve_type(name, change["source"].as_str())?, Vec::new())
+                }
             };
-            let kind = match item {
-                PaletteItem::Object(kind) => Kind::Object(kind.name().to_owned()),
-                PaletteItem::Op(spec) => Kind::Op(spec),
-            };
+            let kind = item
+                .kind()
+                .ok_or_else(|| fail("unknown_type", "That library entry is gone"))?;
             let wanted = change["name"]
                 .as_str()
                 .map(str::trim)
@@ -809,6 +856,69 @@ fn apply_one(
             graph.ui.clear();
             graph.groups.clear();
         }
+        "composite" => {
+            let Some(members) = change["composite"]
+                .as_array()
+                .filter(|list| !list.is_empty())
+            else {
+                return Err(fail(
+                    "invalid_change",
+                    "composite lists the steps to gather",
+                ));
+            };
+            let name = text_of(change, "name")?.to_owned();
+            let ids = members
+                .iter()
+                .map(|member| resolve_node(graph, member))
+                .collect::<Result<Vec<_>, _>>()?;
+            let id = graph.extract_members(&ids, &name).map_err(|error| {
+                fail_hint(
+                    "invalid_composite",
+                    error,
+                    "Gather operation steps only, with no other step both reading from and feeding them",
+                )
+            })?;
+            result["node"] = json!(graph.name(id));
+            result["id"] = json!(id);
+            if let Some(Kind::Composite(composite)) = graph.engine.node(id).map(|node| &node.kind) {
+                result["inputs"] = json!(composite
+                    .inputs
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>());
+                result["outputs"] = json!(composite
+                    .outputs
+                    .iter()
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>());
+            }
+        }
+        "expand" => {
+            let id = resolve_node(graph, &change["expand"])?;
+            let ids = graph
+                .expand_node(id)
+                .map_err(|error| fail("not_a_composite", error))?;
+            result["nodes"] = json!(ids.iter().map(|id| graph.name(*id)).collect::<Vec<_>>());
+        }
+        "save_composite" => {
+            let id = resolve_node(graph, &change["save_composite"])?;
+            let Some(Kind::Composite(composite)) =
+                graph.engine.node(id).map(|node| node.kind.clone())
+            else {
+                return Err(fail(
+                    "not_a_composite",
+                    format!("{} is not a composite", graph.name(id)),
+                ));
+            };
+            let mut saved = (*composite).clone();
+            saved.name = change["name"]
+                .as_str()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map_or_else(|| graph.name(id), str::to_owned);
+            result["saved"] = json!(saved.name);
+            report.saved.push(std::sync::Arc::new(saved));
+        }
         _ => unreachable!("verbs are listed above"),
     }
     report.results.push(result);
@@ -858,6 +968,7 @@ fn node_json(
     let source = match &node.kind {
         Kind::Op(_) => "builtin",
         Kind::Object(_) => "object",
+        Kind::Composite(_) => "composite",
     };
     let mut value = json!({
         "id": node.id,
@@ -865,6 +976,7 @@ fn node_json(
         "type": match &node.kind {
             Kind::Op(spec) => spec.name.to_owned(),
             Kind::Object(name) => name.clone(),
+            Kind::Composite(composite) => composite.name.clone(),
         },
         "source": source,
         "position": position,
@@ -997,13 +1109,28 @@ impl OpenCADStudio {
                 "outputs": fields.iter().filter(|field| field.output).map(port).collect::<Vec<_>>(),
             }));
         }
+        for composite in crate::ui::node_graph::composite_library() {
+            if !wanted(&composite.name, "Composites") && !wanted("composite", "Composites") {
+                continue;
+            }
+            let fields = composite_ports(&composite);
+            types.push(json!({
+                "type": composite.name,
+                "source": "composite",
+                "category": "Composites",
+                "area": "sequence",
+                "add": { "add": { "composite": composite.name } },
+                "inputs": fields.iter().filter(|field| field.input).map(port).collect::<Vec<_>>(),
+                "outputs": fields.iter().filter(|field| field.output).map(port).collect::<Vec<_>>(),
+            }));
+        }
         json!({
             "ok": true,
             "status": "completed",
             "count": types.len(),
             "types": types,
-            "sources": ["builtin", "object"],
-            "reserved_sources": ["composite", "script"],
+            "sources": ["builtin", "object", "composite"],
+            "reserved_sources": ["script"],
         })
     }
 
@@ -1142,6 +1269,9 @@ impl OpenCADStudio {
         self.tabs[i].graph.push_undo(before);
         for (original, copy) in &report.duplicated {
             self.graph_copy_entity(i, *original, *copy);
+        }
+        for composite in &report.saved {
+            crate::ui::node_graph::save_to_library(composite.clone());
         }
         self.command_line.push_info(
             crate::tf!(
@@ -1296,7 +1426,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|port| port["computed"] == true));
-        assert_eq!(library["reserved_sources"], json!(["composite", "script"]));
+        assert_eq!(library["reserved_sources"], json!(["script"]));
     }
 
     #[test]
@@ -1642,5 +1772,169 @@ mod tests {
         ] {
             assert!(names.contains(&name), "{name} in {names:?}");
         }
+    }
+
+    fn output_of(state: &Value, name: &str, port: &str) -> Value {
+        node(state, "sequence", name)["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["name"] == port)
+            .map(|entry| entry["value"].clone())
+            .unwrap_or(Value::Null)
+    }
+
+    /// W=4, One=1, Two=2 → Sum(W+One) → Twice(Sum×Two) → Flip(−Twice).
+    fn arithmetic(app: &mut OpenCADStudio) {
+        let built = apply_changes(
+            app,
+            "k0",
+            json!([
+                {"add": "Number", "name": "W", "values": {"value": 4}},
+                {"add": "Number", "name": "One", "values": {"value": 1}},
+                {"add": "Number", "name": "Two", "values": {"value": 2}},
+                {"add": "Add", "name": "Sum"},
+                {"link": "W.value", "to": "Sum.a"},
+                {"link": "One.value", "to": "Sum.b"},
+                {"add": "Multiply", "name": "Twice"},
+                {"link": "Sum.result", "to": "Twice.a"},
+                {"link": "Two.value", "to": "Twice.b"},
+                {"add": "Negate", "name": "Flip"},
+                {"link": "Twice.result", "to": "Flip.x"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+    }
+
+    #[test]
+    fn steps_become_a_composite_that_computes_the_same_and_expands_back() {
+        let mut app = app();
+        arithmetic(&mut app);
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            graph::value::num(&output_of(&state, "Flip", "result")),
+            Some(-10.0)
+        );
+
+        let made = apply_changes(
+            &mut app,
+            "k1",
+            json!([{"composite": ["Sum", "Twice"], "name": "Grow"}]),
+        );
+        assert_eq!(made["ok"], true, "{made}");
+        assert_eq!(
+            made["result"]["changes"][0]["inputs"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            state["sequence"].as_array().map(Vec::len),
+            Some(2),
+            "{state}"
+        );
+        assert_eq!(node(&state, "sequence", "Grow")["source"], "composite");
+        assert_eq!(
+            graph::value::num(&output_of(&state, "Flip", "result")),
+            Some(-10.0)
+        );
+
+        let set = apply_changes(&mut app, "k2", json!([{"set": "W.value", "value": 9}]));
+        assert_eq!(set["ok"], true, "{set}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            graph::value::num(&output_of(&state, "Flip", "result")),
+            Some(-20.0)
+        );
+
+        // Saved, and used again from the library.
+        let saved = apply_changes(
+            &mut app,
+            "k3",
+            json!([{"save_composite": "Grow", "name": "Grow test"}]),
+        );
+        assert_eq!(saved["ok"], true, "{saved}");
+        let library = read(&mut app, "graph_library", json!({"name": "Grow test"}));
+        assert_eq!(library["types"][0]["source"], "composite", "{library}");
+        let again = apply_changes(
+            &mut app,
+            "k4",
+            json!([{"add": {"composite": "Grow test"}, "name": "Grow 2"}]),
+        );
+        assert_eq!(again["ok"], true, "{again}");
+
+        // Expanded back, the nodes keep their names and their result.
+        let expanded = apply_changes(&mut app, "k5", json!([{"expand": "Grow"}]));
+        assert_eq!(expanded["ok"], true, "{expanded}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(node(&state, "sequence", "Sum")["group"], "Grow");
+        assert_eq!(
+            graph::value::num(&output_of(&state, "Flip", "result")),
+            Some(-20.0)
+        );
+
+        // A saved file keeps composites.
+        let i = app.active_tab;
+        let (loaded, _) =
+            crate::ui::node_graph::Graph::from_file(&app.tabs[i].graph.to_file("")).unwrap();
+        assert!(loaded
+            .engine
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, Kind::Composite(_))));
+        crate::ui::node_graph::forget_library_entry(
+            crate::ui::node_graph::composite_library()
+                .iter()
+                .position(|item| item.name == "Grow test")
+                .unwrap(),
+        );
+    }
+
+    #[test]
+    fn composites_refuse_drawing_nodes_and_undo_as_one_step() {
+        let mut app = app();
+        arithmetic(&mut app);
+        apply_changes(
+            &mut app,
+            "d0",
+            json!([{"add": "Draw Geometry", "name": "Out"}]),
+        );
+        let refused = apply_changes(
+            &mut app,
+            "d1",
+            json!([{"composite": ["Twice", "Out"], "name": "Bad"}]),
+        );
+        assert_eq!(refused["code"], "invalid_composite", "{refused}");
+
+        // From a group in the canvas, then undone.
+        let i = app.active_tab;
+        let ids: Vec<NodeId> = ["Sum", "Twice"]
+            .iter()
+            .map(|name| {
+                let graph = &app.tabs[i].graph;
+                *graph.ui.iter().find(|(_, ui)| ui.name == *name).unwrap().0
+            })
+            .collect();
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::GroupNew(ids[0]));
+        let group = app.tabs[i].graph.ui[&ids[0]].group.unwrap();
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::GroupAssign(
+            ids[1],
+            Some(group),
+        ));
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::GroupToComposite(group));
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            state["sequence"].as_array().map(Vec::len),
+            Some(3),
+            "{state}"
+        );
+        assert_eq!(
+            graph::value::num(&output_of(&state, "Flip", "result")),
+            Some(-10.0)
+        );
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::Undo);
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(state["sequence"].as_array().map(Vec::len), Some(4));
     }
 }

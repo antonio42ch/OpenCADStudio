@@ -12,7 +12,9 @@
 //! `app::node_graph`); operation rows come from the node's spec.
 
 use codec::{EntityType, Handle};
-use graph::{Kind, Link, NodeId, Port, Spec};
+use std::sync::Arc;
+
+use graph::{Composite, Kind, Link, NodeId, Port, Spec};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
 use iced::advanced::{overlay, renderer, Renderer as _, Shell};
@@ -215,14 +217,149 @@ impl ObjectKind {
 pub enum PaletteItem {
     Object(ObjectKind),
     Op(&'static Spec),
+    /// An entry of the composite library, by position.
+    Composite(usize),
 }
 
 impl PaletteItem {
-    fn label(self) -> &'static str {
+    /// The entry's name as the palette shows it.
+    fn title(self) -> String {
         match self {
-            PaletteItem::Object(kind) => kind.name(),
-            PaletteItem::Op(spec) => spec.name,
+            PaletteItem::Object(kind) => t!(kind.name()).into_owned(),
+            PaletteItem::Op(spec) => t!(spec.name).into_owned(),
+            PaletteItem::Composite(k) => composite_library()
+                .get(k)
+                .map(|composite| composite.name.clone())
+                .unwrap_or_default(),
         }
+    }
+
+    /// The node kind it adds; `None` for a library entry that is gone.
+    pub fn kind(self) -> Option<Kind> {
+        Some(match self {
+            PaletteItem::Object(kind) => Kind::Object(kind.name().to_owned()),
+            PaletteItem::Op(spec) => Kind::Op(spec),
+            PaletteItem::Composite(k) => Kind::Composite(composite_library().get(k)?.clone()),
+        })
+    }
+}
+
+// ── Composite library ─────────────────────────────────────────────────────
+// Composites the user saved, offered in the palette for every drawing:
+// a JSON list in the config folder (local storage on the web).
+
+const LIBRARY_FILE: &str = "node_composites.json";
+#[cfg(target_arch = "wasm32")]
+const LIBRARY_KEY: &str = "opencadstudio.node-composites";
+
+fn library_store() -> &'static std::sync::Mutex<Vec<Arc<Composite>>> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<Composite>>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        #[cfg(not(target_arch = "wasm32"))]
+        let body = crate::config::config_dir()
+            .and_then(|dir| std::fs::read_to_string(dir.join(LIBRARY_FILE)).ok());
+        #[cfg(target_arch = "wasm32")]
+        let body = web_sys::window()
+            .and_then(|window| window.local_storage().ok().flatten())
+            .and_then(|storage| storage.get_item(LIBRARY_KEY).ok().flatten());
+        let items = body
+            .and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| Composite::from_json(item).ok().map(Arc::new))
+            .collect();
+        std::sync::Mutex::new(items)
+    })
+}
+
+fn persist_library(items: &[Arc<Composite>]) {
+    let body = Value::Array(items.iter().map(|item| item.to_json()).collect()).to_string();
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(dir) = crate::config::config_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(LIBRARY_FILE), body);
+    }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item(LIBRARY_KEY, &body);
+    }
+}
+
+/// The saved composites, in the order the palette lists them.
+pub fn composite_library() -> Vec<Arc<Composite>> {
+    library_store()
+        .lock()
+        .map(|items| items.clone())
+        .unwrap_or_default()
+}
+
+/// The saved composite called `name`, ignoring case.
+pub fn library_composite(name: &str) -> Option<Arc<Composite>> {
+    let wanted = name.trim().to_lowercase();
+    composite_library()
+        .into_iter()
+        .find(|composite| composite.name.to_lowercase() == wanted)
+}
+
+/// Saves `composite` to the library, replacing one of the same name.
+pub fn save_to_library(composite: Arc<Composite>) {
+    if let Ok(mut items) = library_store().lock() {
+        let name = composite.name.to_lowercase();
+        match items
+            .iter()
+            .position(|item| item.name.to_lowercase() == name)
+        {
+            Some(k) => items[k] = composite,
+            None => items.push(composite),
+        }
+        persist_library(&items);
+    }
+}
+
+/// Drops library entry `k`.
+pub fn forget_library_entry(k: usize) {
+    if let Ok(mut items) = library_store().lock() {
+        if k < items.len() {
+            items.remove(k);
+            persist_library(&items);
+        }
+    }
+}
+
+/// What a composite input accepts: what the inner input it stands for does.
+pub(crate) fn composite_expect(composite: &Composite, name: &str) -> Expect {
+    let Some((_, port)) = composite.inputs.iter().find(|(input, _)| input == name) else {
+        return Expect::Any;
+    };
+    match composite.graph.node(port.node).map(|node| &node.kind) {
+        Some(Kind::Op(spec)) => spec_expect(spec, &port.field),
+        Some(Kind::Composite(inner)) => composite_expect(inner, &port.field),
+        _ => Expect::Any,
+    }
+}
+
+/// What input `field` of an operation accepts, from its default and name.
+pub(crate) fn spec_expect(spec: &Spec, field: &str) -> Expect {
+    let Some(input) = spec.inputs.iter().find(|input| input.name == field) else {
+        return Expect::Any;
+    };
+    if input.list {
+        return Expect::Any;
+    }
+    match input.default {
+        graph::ops::Initial::Num(_) => Expect::Number,
+        graph::ops::Initial::Text(_) => Expect::Text,
+        graph::ops::Initial::Bool(_) => Expect::Bool,
+        graph::ops::Initial::None => match input.name {
+            "curve" => Expect::Curve,
+            "point" | "center" | "vector" | "origin" | "x_axis" | "y_axis" | "start" | "end"
+            | "direction" | "corner" | "from_point" => Expect::Point,
+            "plane" | "from" | "to" => Expect::Plane,
+            _ => Expect::Any,
+        },
     }
 }
 
@@ -519,6 +656,14 @@ pub enum GraphMsg {
     GroupColor(GroupId),
     /// Dissolves a group; its nodes stay where they are.
     GroupDelete(GroupId),
+    /// Turns a group's steps into one composite node.
+    GroupToComposite(GroupId),
+    /// Puts a composite's nodes back in its place.
+    ExpandComposite(NodeId),
+    /// Saves a composite node to the library, under the node's name.
+    SaveComposite(NodeId),
+    /// Drops a library entry.
+    ForgetComposite(usize),
     Undo,
     Redo,
     ConfirmYes,
@@ -575,6 +720,7 @@ pub(crate) fn kind_name(kind: &Kind) -> String {
     match kind {
         Kind::Op(spec) => t!(spec.name).into_owned(),
         Kind::Object(name) => t!(name.as_str()).into_owned(),
+        Kind::Composite(composite) => composite.name.clone(),
     }
 }
 
@@ -662,6 +808,7 @@ fn kind_tag(kind: &Kind) -> String {
         _ if is_input(kind) => t!("Input").into_owned(),
         Kind::Op(spec) => t!(spec.category).into_owned(),
         Kind::Object(_) => t!("Object").into_owned(),
+        Kind::Composite(_) => t!("Composite").into_owned(),
     }
 }
 
@@ -967,10 +1114,9 @@ impl Graph {
     /// Adds a node: an input joins the Inputs area, anything else the end of
     /// the node sequence.
     pub fn add_node(&mut self, item: PaletteItem, handles: Vec<Handle>) -> NodeId {
-        let kind = match item {
-            PaletteItem::Object(kind) => Kind::Object(kind.name().to_owned()),
-            PaletteItem::Op(spec) => Kind::Op(spec),
-        };
+        let kind = item
+            .kind()
+            .unwrap_or_else(|| Kind::Object(ObjectKind::Draw.name().to_owned()));
         let name = self.unique_name(&kind_name(&kind), None, true);
         self.add_named(kind, name, handles)
     }
@@ -1193,6 +1339,204 @@ impl Graph {
         self.prune_groups();
     }
 
+    /// Turns the steps `members` into one composite node called `name`, where
+    /// the last of them was; no undo step is recorded. Steps between the
+    /// members that do not feed them move after the composite first.
+    pub(crate) fn extract_members(
+        &mut self,
+        members: &[NodeId],
+        name: &str,
+    ) -> Result<NodeId, String> {
+        let members: Vec<NodeId> = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| members.contains(&node.id))
+            .map(|node| node.id)
+            .collect();
+        if members.is_empty() {
+            return Err(t!("Choose the steps to put in the composite").into_owned());
+        }
+        for id in &members {
+            match self.engine.node(*id).map(|node| &node.kind) {
+                Some(Kind::Object(_)) => {
+                    return Err(crate::tf!(
+                        "{} draws objects; a composite holds operations only",
+                        self.name(*id)
+                    )
+                    .into_owned())
+                }
+                Some(kind) if is_input(kind) => {
+                    return Err(
+                        crate::tf!("{} is an input; inputs stay outside", self.name(*id))
+                            .into_owned(),
+                    )
+                }
+                _ => {}
+            }
+        }
+        let position =
+            |graph: &graph::Graph, id: NodeId| graph.nodes.iter().position(|node| node.id == id);
+        let (Some(first), Some(last)) = (
+            position(&self.engine, members[0]),
+            position(&self.engine, members[members.len() - 1]),
+        ) else {
+            return Err(t!("Choose the steps to put in the composite").into_owned());
+        };
+        let movers: Vec<NodeId> = self.engine.nodes[first..=last]
+            .iter()
+            .map(|node| node.id)
+            .filter(|id| !members.contains(id))
+            .filter(|id| {
+                !members
+                    .iter()
+                    .any(|member| self.engine.reaches(*id, *member))
+            })
+            .collect();
+        let moved: Vec<graph::Node> = movers
+            .iter()
+            .filter_map(|id| {
+                let at = position(&self.engine, *id)?;
+                Some(self.engine.nodes.remove(at))
+            })
+            .collect();
+        if let Some(at) = position(&self.engine, members[members.len() - 1]) {
+            for (k, node) in moved.into_iter().enumerate() {
+                self.engine.nodes.insert(at + 1 + k, node);
+            }
+        }
+        let names: HashMap<NodeId, String> =
+            members.iter().map(|id| (*id, self.name(*id))).collect();
+        // Inner ids count up from one in the members' order.
+        let meta = json!({
+            "names": members
+                .iter()
+                .enumerate()
+                .map(|(k, id)| ((k + 1).to_string(), json!(names[id])))
+                .collect::<serde_json::Map<String, Value>>(),
+        });
+        let id = self.engine.extract(
+            &members,
+            name,
+            &|port: &Port| format!("{} {}", names[&port.node], port.field),
+            meta,
+        )?;
+        for member in &members {
+            self.ui.remove(member);
+            self.drafts.retain(|port, _| port.node != *member);
+        }
+        let node_name = self.unique_name(name, None, false);
+        let mut open = HashSet::default();
+        open.insert(t!("Geometry").into_owned());
+        self.ui.insert(
+            id,
+            NodeUi {
+                name: node_name,
+                open,
+                handles: Vec::new(),
+                group: None,
+            },
+        );
+        self.prune_groups();
+        self.prune_links();
+        Ok(id)
+    }
+
+    /// Makes a group's steps one composite node named after the group, as
+    /// one undo step.
+    pub fn make_composite(&mut self, group: GroupId) -> Result<NodeId, String> {
+        let name = self
+            .group(group)
+            .map(|group| group.name.clone())
+            .unwrap_or_else(|| t!("Composite").into_owned());
+        let members: Vec<NodeId> = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| self.node_group(node.id) == Some(group))
+            .map(|node| node.id)
+            .collect();
+        let before = self.snapshot();
+        match self.extract_members(&members, &name) {
+            Ok(id) => {
+                self.push_undo(before);
+                Ok(id)
+            }
+            Err(error) => {
+                self.restore_content(before);
+                Err(error)
+            }
+        }
+    }
+
+    /// Puts composite `id`'s nodes back where it was, with the names they
+    /// had, gathered in a group named after it; no undo step is recorded.
+    pub(crate) fn expand_node(&mut self, id: NodeId) -> Result<Vec<NodeId>, String> {
+        let Some(Kind::Composite(composite)) = self.engine.node(id).map(|node| node.kind.clone())
+        else {
+            return Err(crate::tf!("{} is not a composite", self.name(id)).into_owned());
+        };
+        let title = self.name(id);
+        let ids = self.engine.expand(id)?;
+        self.ui.remove(&id);
+        self.drafts.retain(|port, _| port.node != id);
+        let mut added: Vec<NodeId> = ids.values().copied().collect();
+        added.sort_by_key(|new| self.engine.nodes.iter().position(|node| node.id == *new));
+        for (inner, new) in &ids {
+            let wanted = composite.meta["names"][inner.to_string()]
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    self.engine
+                        .node(*new)
+                        .map(|node| kind_name(&node.kind))
+                        .unwrap_or_default()
+                });
+            let name = self.unique_name(&wanted, None, false);
+            let mut open = HashSet::default();
+            open.insert(t!("Geometry").into_owned());
+            self.ui.insert(
+                *new,
+                NodeUi {
+                    name,
+                    open,
+                    handles: Vec::new(),
+                    group: None,
+                },
+            );
+        }
+        if let Some(first) = added.first() {
+            self.new_group(*first);
+            if let Some(group) = self.node_group(*first) {
+                if let Some(known) = self.groups.iter_mut().find(|known| known.id == group) {
+                    known.name = title;
+                }
+                for new in &added {
+                    if let Some(ui) = self.ui.get_mut(new) {
+                        ui.group = Some(group);
+                    }
+                }
+            }
+        }
+        self.prune_links();
+        Ok(added)
+    }
+
+    /// Expands composite `id` as one undo step.
+    pub fn expand_composite(&mut self, id: NodeId) -> Result<Vec<NodeId>, String> {
+        let before = self.snapshot();
+        match self.expand_node(id) {
+            Ok(ids) => {
+                self.push_undo(before);
+                Ok(ids)
+            }
+            Err(error) => {
+                self.restore_content(before);
+                Err(error)
+            }
+        }
+    }
+
     /// Rows of an operation node, read from its spec. An input sharing its
     /// name with an output is one row with both ports.
     fn op_sections(&self, id: NodeId, spec: &'static Spec) -> Vec<NodeSection> {
@@ -1263,8 +1607,39 @@ impl Graph {
             .map(|node| match node.kind {
                 Kind::Op(spec) => self.op_sections(node.id, spec),
                 Kind::Object(_) => objects.remove(&node.id).unwrap_or_default(),
+                Kind::Composite(ref composite) => self.composite_sections(node.id, composite),
             })
             .collect()
+    }
+
+    /// A composite's rows: its exposed inputs, then its outputs.
+    fn composite_sections(&self, id: NodeId, composite: &Composite) -> Vec<NodeSection> {
+        let Some(node) = self.engine.node(id) else {
+            return Vec::new();
+        };
+        let inputs = composite.inputs.iter().map(|(name, _)| NodeRow {
+            field: name.clone(),
+            label: name.clone(),
+            value: self.engine.input(&Port {
+                node: id,
+                field: name.clone(),
+            }),
+            input: true,
+            output: false,
+            widget: RowWidget::Field,
+        });
+        let outputs = composite.outputs.iter().map(|(name, _)| NodeRow {
+            field: name.clone(),
+            label: name.clone(),
+            value: node.outputs.get(name).cloned().unwrap_or(Value::Null),
+            input: false,
+            output: true,
+            widget: RowWidget::Field,
+        });
+        vec![NodeSection {
+            title: String::new(),
+            rows: inputs.chain(outputs).collect(),
+        }]
     }
 
     fn is_open(&self, id: NodeId, section: &NodeSection) -> bool {
@@ -1315,27 +1690,8 @@ impl Graph {
     /// the kind of value it holds now.
     pub(crate) fn expect(&self, target: &Port, value: &Value) -> Expect {
         match self.engine.node(target.node).map(|node| &node.kind) {
-            Some(Kind::Op(spec)) => {
-                let Some(input) = spec.inputs.iter().find(|input| input.name == target.field)
-                else {
-                    return Expect::Any;
-                };
-                if input.list {
-                    return Expect::Any;
-                }
-                match input.default {
-                    graph::ops::Initial::Num(_) => Expect::Number,
-                    graph::ops::Initial::Text(_) => Expect::Text,
-                    graph::ops::Initial::Bool(_) => Expect::Bool,
-                    graph::ops::Initial::None => match input.name {
-                        "curve" => Expect::Curve,
-                        "point" | "center" | "vector" | "origin" | "x_axis" | "y_axis"
-                        | "start" | "end" | "direction" | "corner" | "from_point" => Expect::Point,
-                        "plane" | "from" | "to" => Expect::Plane,
-                        _ => Expect::Any,
-                    },
-                }
-            }
+            Some(Kind::Op(spec)) => spec_expect(spec, &target.field),
+            Some(Kind::Composite(composite)) => composite_expect(composite, &target.field),
             Some(Kind::Object(_)) => Expect::of_value(value),
             None => Expect::Any,
         }
@@ -1683,6 +2039,11 @@ impl Graph {
             text(size.into_owned()).size(10).style(weak_text),
             Space::new().width(Length::Fill),
             icon_button(
+                crate::ui::icons::NODE_GRAPH,
+                "Make a composite node of this group",
+                (!group.inputs).then_some(GraphMsg::GroupToComposite(id))
+            ),
+            icon_button(
                 crate::ui::icons::CLOSE,
                 "Ungroup",
                 Some(GraphMsg::GroupDelete(id))
@@ -1769,6 +2130,18 @@ impl Graph {
         .align_y(iced::Center);
         for element in extra {
             header = header.push(element);
+        }
+        if matches!(node.kind, Kind::Composite(_)) {
+            header = header.push(icon_button(
+                crate::ui::icons::SPLIT_H,
+                "Expand into its nodes",
+                Some(GraphMsg::ExpandComposite(id)),
+            ));
+            header = header.push(icon_button(
+                crate::ui::icons::SAVE,
+                "Save to the composite library",
+                Some(GraphMsg::SaveComposite(id)),
+            ));
         }
         header = header.push(icon_button(
             crate::ui::icons::COPY,
@@ -2473,18 +2846,30 @@ impl Graph {
                     || Space::new().width(14.0).into(),
                     |bytes| crate::ui::icons::semantic(bytes, 14.0),
                 ),
-            PaletteItem::Op(_) => Space::new().width(14.0).into(),
+            PaletteItem::Op(_) | PaletteItem::Composite(_) => Space::new().width(14.0).into(),
         };
-        button(
-            row![icon, text(t!(item.label())).size(12)]
+        let entry = button(
+            row![icon, text(item.title()).size(12)]
                 .spacing(6)
                 .align_y(iced::Center),
         )
         .on_press(msg(GraphMsg::Add(item)))
         .style(button::text)
         .padding([3, 10])
-        .width(Length::Fill)
-        .into()
+        .width(Length::Fill);
+        match item {
+            PaletteItem::Composite(k) => row![
+                entry,
+                icon_button(
+                    crate::ui::icons::TRASH,
+                    "Remove from library",
+                    Some(GraphMsg::ForgetComposite(k))
+                )
+            ]
+            .align_y(iced::Center)
+            .into(),
+            _ => entry.into(),
+        }
     }
 
     /// The node library as a docked panel: title bar, a search box with the
@@ -2526,16 +2911,21 @@ impl Graph {
         .align_y(iced::Center);
 
         let query = self.search.trim().to_lowercase();
-        let wanted = |item: PaletteItem| {
-            query.is_empty() || t!(item.label()).to_lowercase().contains(&query)
-        };
+        let wanted =
+            |item: PaletteItem| query.is_empty() || item.title().to_lowercase().contains(&query);
         let mut tree = column![].spacing(1);
-        let categories = std::iter::once("Objects").chain(graph::CATEGORIES.iter().copied());
+        let categories = ["Objects", "Composites"]
+            .into_iter()
+            .chain(graph::CATEGORIES.iter().copied());
         for category in categories {
             let items: Vec<PaletteItem> = if category == "Objects" {
                 OBJECTS
                     .iter()
                     .map(|kind| PaletteItem::Object(*kind))
+                    .collect()
+            } else if category == "Composites" {
+                (0..composite_library().len())
+                    .map(PaletteItem::Composite)
                     .collect()
             } else {
                 graph::LIBRARY

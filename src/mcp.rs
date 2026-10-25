@@ -34,9 +34,10 @@ const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// `grip_drag` became optional-`handle` (built-in entity grips) plus optional
 /// `plugin` (dragging a plugin-declared custom grip, routed to its owner).
 /// The node graph added the `graph_library`, `graph_state` and
-/// `graph_validate` reads and the `graph_apply` edit.
+/// `graph_validate` reads and the `graph_apply` edit, which then gained the
+/// composite changes.
 #[cfg(test)]
-const TOOL_SCHEMA_DIGEST: &str = "749fe7fd56f99909c07574c0de42c215d4b80ab6320fe04c0757d00b7085ae4f";
+const TOOL_SCHEMA_DIGEST: &str = "ba0af519795feba0415236f64c6e9eddd286fbdbac8a3e6634800e2f13e334ff";
 const MAX_REQUEST: usize = 1_048_576;
 const MAX_RESPONSE: u64 = 16 * 1024 * 1024;
 const CACHE_TTL_MS: u64 = 3_600_000;

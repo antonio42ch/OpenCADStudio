@@ -480,6 +480,29 @@ impl OpenCADStudio {
                 });
             }
             GraphMsg::FromSelection => return self.graph_from_selection(i),
+            GraphMsg::GroupToComposite(group) => match self.tabs[i].graph.make_composite(group) {
+                Ok(_) => return self.graph_run(i),
+                Err(error) => self.command_line.push_error(&error),
+            },
+            GraphMsg::ExpandComposite(id) => match self.tabs[i].graph.expand_composite(id) {
+                Ok(_) => return self.graph_run(i),
+                Err(error) => self.command_line.push_error(&error),
+            },
+            GraphMsg::SaveComposite(id) => {
+                let graph = &self.tabs[i].graph;
+                if let Some(Kind::Composite(composite)) =
+                    graph.engine.node(id).map(|node| node.kind.clone())
+                {
+                    let name = graph.name(id);
+                    let mut saved = (*composite).clone();
+                    saved.name = name.clone();
+                    crate::ui::node_graph::save_to_library(std::sync::Arc::new(saved));
+                    self.command_line.push_output(
+                        crate::tf!("{} saved to the composite library", name).as_ref(),
+                    );
+                }
+            }
+            GraphMsg::ForgetComposite(k) => crate::ui::node_graph::forget_library_entry(k),
             GraphMsg::GroupRenameStart(_) => {
                 return iced::widget::operation::focus(iced::widget::Id::new(
                     crate::ui::node_graph::RENAME_ID,
@@ -591,7 +614,7 @@ impl OpenCADStudio {
                 for node in &graph.engine.nodes {
                     let kind = match &node.kind {
                         Kind::Object(name) => ObjectKind::from_name(name),
-                        Kind::Op(_) => None,
+                        Kind::Op(_) | Kind::Composite(_) => None,
                     };
                     if let Some(ui) = graph.ui.get_mut(&node.id) {
                         ui.handles.retain(|handle| {

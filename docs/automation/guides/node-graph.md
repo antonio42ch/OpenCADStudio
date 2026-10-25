@@ -53,8 +53,19 @@ Nodes have unique names (case-insensitive). Address a node by name or as `#id`, 
 | `group` | list of nodes of one area, `name` (joins or creates); optional `color` |
 | `ungroup` | group name |
 | `clear` | `true`: empties the graph; drawn entities stay |
+| `composite` | list of steps, `name`: one composite node in their place (see below) |
+| `expand` | composite node: its steps back in its place, named as they were, in a group |
+| `save_composite` | composite node; optional `name`: saved to the user's composite library |
 
 The result lists each change's outcome (`node`, `id`, `links_dropped`), `warnings`, the new `graph_revision` and the node names.
+
+## Composites
+
+A composite is a graph of operation steps used as one node: the tool a combination of generic nodes becomes. `{"composite": ["Axis", "Face", "Rounded"], "name": "Wall outline"}` replaces those steps with one node where the last of them was. Every link from outside into the steps becomes one of its inputs (named `Node port`, e.g. `Axis start`), every link out of them one of its outputs; with nothing outside reading them, the last step's outputs are exposed. Steps that sat between them without feeding them move after it. Inputs-area nodes, object nodes and Draw Geometry stay outside, so a composite computes and the graph around it draws.
+
+`save_composite` keeps it in the user's composite library, which every drawing's palette lists under Composites and `graph_library` reports with `source: "composite"`; `{"add": {"composite": "Wall outline"}}` adds a copy. `expand` opens one back into its steps to change it. Composites are saved inside the `.ocg` file, so a graph never depends on the library.
+
+Nested lists are the graph's trees: Graft, Flatten Once, List Depth, Cross Reference, Weave, Shift List and Cull Pattern reshape them, and a list reaching a step's single-value input runs the step once per element, recursively.
 
 ## Rules and errors
 
@@ -65,7 +76,8 @@ The first refused change stops the request and nothing is applied; the error car
 - `would_break_links`: `remove` or `move` would clear inputs other nodes feed; `links` lists them. Repeat with `"force": true` to accept.
 - `unknown_node`, `unknown_port`, `unknown_type`, `ambiguous_type`, `unknown_group`, `invalid_value`, `invalid_change`, `wrong_area`, `mixed_areas`.
 - `entity_absent`, `entity_owned`, `unsupported_entity`, `invalid_handle` for `adopt`.
-- `not_supported`: `{"add": {"script": …}}` and `{"add": {"composite": …}}` are reserved for script and composite nodes.
+- `invalid_composite`: a composite takes operation steps only (no inputs, objects or Draw Geometry), and no other step may both read from the gathered steps and feed them.
+- `not_supported`: `{"add": {"script": …}}` is reserved for script nodes.
 
 Warnings do not stop the request: `name_taken` (the node got a numbered name), `type_mismatch` (linked kinds differ), `not_linked`.
 
