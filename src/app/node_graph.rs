@@ -15,10 +15,21 @@ use serde_json::{json, Value};
 impl OpenCADStudio {
     /// The Properties panel's single-object page for `handle`.
     fn graph_panel_sections(&self, i: usize, handle: Handle) -> Vec<PropSection> {
+        match self.tabs[i].scene.document.get_entity(handle) {
+            Some(entity) => self.graph_entity_sections(i, handle, entity),
+            None => Vec::new(),
+        }
+    }
+
+    /// The Properties panel's page for `entity`, which need not be in the
+    /// drawing (`handle` is then null).
+    fn graph_entity_sections(
+        &self,
+        i: usize,
+        handle: Handle,
+        entity: &codec::EntityType,
+    ) -> Vec<PropSection> {
         let tab = &self.tabs[i];
-        let Some(entity) = tab.scene.document.get_entity(handle) else {
-            return Vec::new();
-        };
         crate::entities::common::set_unit_context(
             crate::entities::common::UnitContext::from_header(&tab.scene.document.header),
         );
@@ -68,47 +79,93 @@ impl OpenCADStudio {
             _ => own,
         };
         let panel = self.graph_panel_sections(i, first);
-        if panel.is_empty() {
-            return Vec::new();
-        }
-        let object = NodeRow {
-            field: "object".to_owned(),
-            label: crate::t!("Object").into_owned(),
-            value: value("object", json!({ "handle": first.value() })),
-            input: false,
-            output: true,
-            widget: RowWidget::Field,
-        };
-        std::iter::once(NodeSection {
-            title: String::new(),
-            rows: vec![object],
-        })
-        .chain(panel.into_iter().map(|section| {
-            NodeSection {
-                title: section.title,
-                rows: section
-                    .props
-                    .iter()
-                    .map(|property| {
-                        let json = crate::app::control::property_json(property);
-                        NodeRow {
-                            field: property.field.to_owned(),
-                            label: property.label.clone(),
-                            input: !matches!(
-                                json["kind"].as_str(),
-                                Some("readonly" | "specialized")
-                            ),
-                            output: true,
-                            value: value(property.field, json["value"].clone()),
-                            widget: RowWidget::Field,
-                        }
-                    })
-                    .collect(),
-            }
-        }))
-        .collect()
+        graph_rows(panel, json!({ "handle": first.value() }), value)
     }
 
+    /// The ports of an object node of `kind`, with the value kinds the
+    /// Properties panel gives its rows, for automation clients.
+    pub(super) fn graph_kind_ports(
+        &self,
+        i: usize,
+        kind: ObjectKind,
+    ) -> Vec<crate::app::graph_ops::Field> {
+        use crate::app::graph_ops::{property_kind, Field};
+        let panel = self.graph_entity_sections(i, Handle::NULL, &kind.entity());
+        let object = Field {
+            name: "object".to_owned(),
+            label: crate::t!("Object").into_owned(),
+            input: false,
+            output: true,
+            kind: crate::ui::node_graph::Expect::Object,
+        };
+        std::iter::once(object)
+            .chain(
+                panel
+                    .iter()
+                    .flat_map(|section| &section.props)
+                    .map(|property| {
+                        let json = crate::app::control::property_json(property);
+                        let kind = json["kind"].as_str().unwrap_or_default();
+                        Field {
+                            name: property.field.to_owned(),
+                            label: crate::t!(property.label.as_str()).into_owned(),
+                            input: !matches!(kind, "readonly" | "specialized"),
+                            output: true,
+                            kind: property_kind(kind, &json["value"]),
+                        }
+                    }),
+            )
+            .collect()
+    }
+}
+
+/// An object node's rows from its entity's panel page: the `object` handle
+/// row, then every property, settable unless the panel shows it read-only.
+/// `value` picks what a row shows from its field and the entity's own value.
+fn graph_rows(
+    panel: Vec<PropSection>,
+    object: Value,
+    value: impl Fn(&str, Value) -> Value,
+) -> Vec<NodeSection> {
+    if panel.is_empty() {
+        return Vec::new();
+    }
+    let object = NodeRow {
+        field: "object".to_owned(),
+        label: crate::t!("Object").into_owned(),
+        value: value("object", object),
+        input: false,
+        output: true,
+        widget: RowWidget::Field,
+    };
+    std::iter::once(NodeSection {
+        title: String::new(),
+        rows: vec![object],
+    })
+    .chain(panel.into_iter().map(|section| {
+        NodeSection {
+            title: section.title,
+            rows: section
+                .props
+                .iter()
+                .map(|property| {
+                    let json = crate::app::control::property_json(property);
+                    NodeRow {
+                        field: property.field.to_owned(),
+                        label: property.label.clone(),
+                        input: !matches!(json["kind"].as_str(), Some("readonly" | "specialized")),
+                        output: true,
+                        value: value(property.field, json["value"].clone()),
+                        widget: RowWidget::Field,
+                    }
+                })
+                .collect(),
+        }
+    }))
+    .collect()
+}
+
+impl OpenCADStudio {
     /// Every node's rows, parallel to the graph's node list.
     pub(super) fn graph_all_sections(&self, i: usize) -> Vec<Vec<NodeSection>> {
         let graph = &self.tabs[i].graph;
@@ -153,7 +210,7 @@ impl OpenCADStudio {
     }
 
     /// Runs `edit`, then re-evaluates the graph, all as one undo step.
-    fn graph_step(
+    pub(super) fn graph_step(
         &mut self,
         i: usize,
         edit: impl FnOnce(&mut Self) -> Vec<Task<Message>>,
@@ -219,23 +276,7 @@ impl OpenCADStudio {
                 // An object copy starts from its own copy of the original's
                 // first entity.
                 if let Some((original, copy)) = self.tabs[i].graph.duplicated.take() {
-                    let first = self.tabs[i]
-                        .graph
-                        .ui
-                        .get(&original)
-                        .and_then(|ui| ui.handles.first().copied());
-                    let entity = first
-                        .and_then(|handle| self.tabs[i].scene.document.get_entity(handle))
-                        .cloned();
-                    if let Some(mut entity) = entity {
-                        entity.common_mut().handle = Handle::NULL;
-                        if let Some(handle) = self.commit_entity_handle(entity) {
-                            self.tabs[i].dirty = true;
-                            if let Some(ui) = self.tabs[i].graph.ui.get_mut(&copy) {
-                                ui.handles = vec![handle];
-                            }
-                        }
-                    }
+                    self.graph_copy_entity(i, original, copy);
                 }
                 return self.graph_run(i);
             }
@@ -433,8 +474,30 @@ impl OpenCADStudio {
         self.graph_run(i)
     }
 
+    /// Gives the copy `copy` of object node `original` its own copy of the
+    /// original's first entity.
+    pub(super) fn graph_copy_entity(&mut self, i: usize, original: NodeId, copy: NodeId) {
+        let first = self.tabs[i]
+            .graph
+            .ui
+            .get(&original)
+            .and_then(|ui| ui.handles.first().copied());
+        let entity = first
+            .and_then(|handle| self.tabs[i].scene.document.get_entity(handle))
+            .cloned();
+        if let Some(mut entity) = entity {
+            entity.common_mut().handle = Handle::NULL;
+            if let Some(handle) = self.commit_entity_handle(entity) {
+                self.tabs[i].dirty = true;
+                if let Some(ui) = self.tabs[i].graph.ui.get_mut(&copy) {
+                    ui.handles = vec![handle];
+                }
+            }
+        }
+    }
+
     /// Erases the entities in `handles` that still exist.
-    fn graph_erase(&mut self, i: usize, handles: Vec<Handle>) {
+    pub(super) fn graph_erase(&mut self, i: usize, handles: Vec<Handle>) {
         let live: Vec<Handle> = handles
             .into_iter()
             .filter(|handle| self.tabs[i].scene.document.get_entity(*handle).is_some())

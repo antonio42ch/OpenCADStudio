@@ -82,6 +82,10 @@ const ENVELOPE_OPS: &[&str] = &[
     "activate",
     "get_selection",
     "getpoint",
+    "graph_library",
+    "graph_state",
+    "graph_validate",
+    "graph_apply",
 ];
 
 /// Loopback REST channel hosted by the GUI process: `OpenCADStudio.exe

@@ -7098,3 +7098,4 @@ node-graph =
     .objects-taken = __ocs_fmt_0__ objetos ya pertenecen a un nodo
     .objects-unsupported = __ocs_fmt_0__ objetos son de un tipo que los nodos no admiten
     .steps-count = __ocs_fmt_0__ pasos
+    .automation-changed = Grafo de nodos modificado por un cliente de automatización (__ocs_fmt_0__ cambios)

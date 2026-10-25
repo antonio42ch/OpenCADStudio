@@ -511,6 +511,29 @@ client's own log.
 
 ---
 
+### 6.13 Node graph
+
+The drawing's node graph: hand-typed values live in **Inputs**-area nodes,
+every other node sits in the **node sequence** and takes each input from an
+input node or an earlier step. Nodes have unique names; ports are written
+`"Node.port"`. The complete guide is `cad://guides/node-graph`.
+
+| Op | Fields | Notes |
+|---|---|---|
+| `graph_library` | optional `name`, `search` | Node types with `source` (`builtin`, `object`; `composite`/`script` reserved), `category`, `area`, and ports with `kind` |
+| `graph_state` | optional `detail:"summary"` | `graph_revision`, `inputs`, `sequence` (names, types, groups, entities, ports with value/kind/`computed`/`source`), `groups` |
+| `graph_validate` | `request` (a `graph_apply` request) | Dry run on a copy of the live graph: `valid`, results, warnings, links that would drop |
+| `graph_apply` | `changes[]`, optional `graph_revision` | All-or-nothing, one graph undo step, evaluated once. Changes: `add`, `adopt`, `set`, `link`/`to`, `unlink`, `move`/`after`, `remove`, `rename`/`to`, `duplicate`, `group`/`name`, `ungroup`, `clear` |
+
+A refused change stops the request with its `index`, a `code`
+(`manual_value_outside_inputs`, `backward_link`, `would_break_links` with
+`links`, `unknown_node`, `unknown_port`, `unknown_type`, `ambiguous_type`,
+`not_supported`, `stale_graph`, …) and usually a `hint`; nothing is applied.
+`remove` and `move` that would drop links need `"force": true`.
+
+REST: `POST /graph_library`, `/graph_state`, `/graph_validate`, `/graph_apply`
+through the envelope passthrough.
+
 ## 7. Worked examples
 
 ### 7.1 Draw, verify, publish (REST)

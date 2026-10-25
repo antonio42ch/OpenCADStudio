@@ -52,6 +52,7 @@ mod measurement;
 mod model_ops;
 mod mtext_editor;
 mod navigation;
+mod graph_ops;
 mod node_graph;
 mod options_session;
 #[cfg(not(target_arch = "wasm32"))]

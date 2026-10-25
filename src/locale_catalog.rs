@@ -6188,6 +6188,7 @@ pub(super) fn message_attribute(source: &str) -> Option<(&'static str, &'static 
         "{} objects already belong to a node" => Some(("node-graph", "objects-taken")),
         "{} objects are of a kind nodes cannot hold" => Some(("node-graph", "objects-unsupported")),
         "{} steps" => Some(("node-graph", "steps-count")),
+        "Node graph changed by an automation client ({} changes)" => Some(("node-graph", "automation-changed")),
         "Graphic Attributes" => Some(("graphic-attributes", "title")),
         "Set all attributes ByLayer" => Some(("graphic-attributes", "set-all-bylayer")),
         "Set all attributes ByBlock" => Some(("graphic-attributes", "set-all-byblock")),

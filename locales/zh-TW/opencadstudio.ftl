@@ -7093,3 +7093,4 @@ node-graph =
     .objects-taken = __ocs_fmt_0__ objects already belong to a node
     .objects-unsupported = __ocs_fmt_0__ objects are of a kind nodes cannot hold
     .steps-count = __ocs_fmt_0__ steps
+    .automation-changed = Node graph changed by an automation client (__ocs_fmt_0__ changes)

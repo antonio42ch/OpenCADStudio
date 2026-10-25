@@ -868,6 +868,26 @@ pub static STOP: OpDef = OpDef {
     example: r#"{"op":"stop"}"#,
 };
 
+pub static GRAPH_APPLY: OpDef = OpDef {
+    name: "graph_apply",
+    doc: "Edit the node graph: a list of changes applied all-or-nothing as one graph undo step, then evaluated once. Each change names one action: add (node type from graph_library, optional name, values for inputs, after, group, source to tell object from builtin), remove, rename (to), set (input value), link (Node.port) to (Node.port), unlink, move (after: \"start\" or a node), group (nodes, name), ungroup, duplicate, adopt (entity handle), clear. Values flow only forward along the node sequence and are typed only in Inputs-area nodes; remove and move that would drop links need force: true. Read guide node-graph first.",
+    batchable: true,
+    params: &[
+        req(
+            "changes",
+            Ty::Raw(r#"{"type":"array","minItems":1,"maxItems":256,"items":{"type":"object","minProperties":1}}"#),
+            "Changes in order; later ones may name nodes earlier ones added.",
+        ),
+        opt(
+            "graph_revision",
+            Ty::Int,
+            "graph_revision from graph_state; a different current revision refuses the request as stale_graph.",
+        ),
+    ],
+    rules: &[],
+    example: r#"{"op":"graph_apply","changes":[{"add":"Number","name":"Width","values":{"value":0.3}}]}"#,
+};
+
 pub static BATCH: OpDef = OpDef {
     name: "batch",
     doc: "Execute sequential operations with fresh state and step idempotency keys. Stops on first error.",
@@ -922,6 +942,7 @@ pub static OPS: &[&OpDef] = &[
     &SAVE,
     &SAVE_VERIFIED,
     &STOP,
+    &GRAPH_APPLY,
     &BATCH,
 ];
 

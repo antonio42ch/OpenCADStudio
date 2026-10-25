@@ -625,6 +625,9 @@ impl OpenCADStudio {
                 | "cad_get_blocks"
                 | "cad_extract_block_instances"
                 | "keytips"
+                | "graph_library"
+                | "graph_state"
+                | "graph_validate"
         );
         if !query && !self.control.enabled {
             return (
@@ -956,6 +959,9 @@ impl OpenCADStudio {
                 | "block_instances"
                 | "cad_get_blocks"
                 | "cad_extract_block_instances" => self.control_blocks(&req).unwrap_or_else(|e| e),
+                "graph_library" => self.control_graph_library(&req),
+                "graph_state" => self.control_graph_state(&req),
+                "graph_validate" => self.control_graph_validate(&req),
                 "history" => {
                     json!({"ok":true,"entries":self.command_line.history.iter().map(|e|json!({"kind":format!("{:?}",e.kind),"text":e.text})).collect::<Vec<_>>()})
                 }
@@ -1257,6 +1263,7 @@ impl OpenCADStudio {
             "block_define" => self.control_block_define(req)?,
             "block_delete" => self.control_block_delete(req)?,
             "group_create" => self.control_group_create(req)?,
+            "graph_apply" => self.control_graph_apply(req)?,
             "selection_set_save" => self.control_selection_set_save(req)?,
             "selection_set_load" => self.control_selection_set_load(req)?,
             "user_select" => self.control_user_select(req)?,

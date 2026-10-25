@@ -61,7 +61,7 @@ pub fn is_input(kind: &Kind) -> bool {
 }
 
 /// Drawing objects a node can create.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ObjectKind {
     Line,
     Circle,
@@ -89,6 +89,9 @@ const OBJECTS: &[ObjectKind] = &[
 ];
 
 impl ObjectKind {
+    /// Every kind, in palette order.
+    pub const ALL: &'static [ObjectKind] = OBJECTS;
+
     /// Display name, also the graph's object type name.
     pub fn name(self) -> &'static str {
         match self {
@@ -273,15 +276,25 @@ pub struct Confirm {
 
 /// Everything an undo step restores.
 #[derive(Clone)]
-struct Snapshot {
+pub(crate) struct Snapshot {
     engine: graph::Graph,
     ui: HashMap<NodeId, NodeUi>,
     groups: Vec<NodeGroup>,
 }
 
+impl Snapshot {
+    /// The name node `id` had.
+    pub(crate) fn name(&self, id: NodeId) -> String {
+        self.ui
+            .get(&id)
+            .map(|ui| ui.name.clone())
+            .unwrap_or_default()
+    }
+}
+
 /// The kind of value an input expects, so the picker can dim the rest.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Expect {
+pub(crate) enum Expect {
     Any,
     Number,
     Text,
@@ -291,7 +304,7 @@ enum Expect {
 }
 
 impl Expect {
-    fn of_value(value: &Value) -> Self {
+    pub(crate) fn of_value(value: &Value) -> Self {
         match value {
             Value::Number(_) => Expect::Number,
             Value::String(_) => Expect::Text,
@@ -303,7 +316,7 @@ impl Expect {
     }
 
     /// Whether `value` can feed this input; a list feeds it element-wise.
-    fn fits(self, value: &Value) -> bool {
+    pub(crate) fn fits(self, value: &Value) -> bool {
         match value {
             Value::Null => true,
             Value::Array(items) => items.first().is_none_or(|item| self.fits(item)),
@@ -321,6 +334,27 @@ impl Expect {
                 Expect::Object => value.get("handle").is_some(),
             },
         }
+    }
+
+    /// The kind's name in automation payloads.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Expect::Any => "any",
+            Expect::Number => "number",
+            Expect::Text => "text",
+            Expect::Bool => "bool",
+            Expect::Point => "point",
+            Expect::Object => "object",
+        }
+    }
+
+    /// Whether a value of kind `actual` can feed an input of this kind;
+    /// an unknown kind on either side fits.
+    pub(crate) fn accepts(self, actual: Expect) -> bool {
+        self == Expect::Any
+            || actual == Expect::Any
+            || self == actual
+            || (self == Expect::Text && matches!(actual, Expect::Number | Expect::Bool))
     }
 
     fn label(self) -> Option<&'static str> {
@@ -379,6 +413,9 @@ pub struct Graph {
     /// Only the Inputs area shows, so the drawing stays visible while the
     /// inputs are tuned.
     pub steps_hidden: bool,
+    /// Counts structural edits, so automation clients can tell when the
+    /// graph they read has changed.
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -473,7 +510,7 @@ pub fn display(value: &Value) -> String {
 }
 
 /// The type name shown under a node's own name.
-fn kind_name(kind: &Kind) -> String {
+pub(crate) fn kind_name(kind: &Kind) -> String {
     match kind {
         Kind::Op(spec) => t!(spec.name).into_owned(),
         Kind::Object(name) => t!(name.as_str()).into_owned(),
@@ -757,7 +794,7 @@ impl Graph {
         ))
     }
 
-    fn snapshot(&self) -> Snapshot {
+    pub(crate) fn snapshot(&self) -> Snapshot {
         Snapshot {
             engine: self.engine.clone(),
             ui: self.ui.clone(),
@@ -778,12 +815,27 @@ impl Graph {
 
     /// Saves the graph as an undo step before an edit.
     pub fn record(&mut self) {
-        self.undo.push(self.snapshot());
+        let snapshot = self.snapshot();
+        self.push_undo(snapshot);
+    }
+
+    /// Makes `snapshot`, taken before an edit, that edit's undo step.
+    pub(crate) fn push_undo(&mut self, snapshot: Snapshot) {
+        self.undo.push(snapshot);
         if self.undo.len() > HISTORY {
             self.undo.remove(0);
         }
         self.redo.clear();
         self.recording = None;
+        self.revision += 1;
+    }
+
+    /// Puts back the nodes, links and groups of `snapshot`, keeping the
+    /// canvas state (history, picker, zoom) as it is.
+    pub(crate) fn restore_content(&mut self, snapshot: Snapshot) {
+        self.engine = snapshot.engine;
+        self.ui = snapshot.ui;
+        self.groups = snapshot.groups;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -814,7 +866,7 @@ impl Graph {
         self.drafts.clear();
     }
 
-    fn taken(&self, name: &str, except: Option<NodeId>) -> bool {
+    pub(crate) fn taken(&self, name: &str, except: Option<NodeId>) -> bool {
         let name = name.to_lowercase();
         self.ui
             .iter()
@@ -823,7 +875,7 @@ impl Graph {
 
     /// `base` itself when free (and not `numbered`), else `base 2`, `base 3`…
     /// A numbered default starts at `base 1`.
-    fn unique_name(&self, base: &str, except: Option<NodeId>, numbered: bool) -> String {
+    pub(crate) fn unique_name(&self, base: &str, except: Option<NodeId>, numbered: bool) -> String {
         if !numbered && !self.taken(base, except) {
             return base.to_owned();
         }
@@ -841,11 +893,11 @@ impl Graph {
             .unwrap_or_default()
     }
 
-    fn group(&self, id: GroupId) -> Option<&NodeGroup> {
+    pub(crate) fn group(&self, id: GroupId) -> Option<&NodeGroup> {
         self.groups.iter().find(|group| group.id == id)
     }
 
-    fn node_group(&self, id: NodeId) -> Option<GroupId> {
+    pub(crate) fn node_group(&self, id: NodeId) -> Option<GroupId> {
         self.ui.get(&id).and_then(|ui| ui.group)
     }
 
@@ -860,7 +912,7 @@ impl Graph {
         self.add_named(kind, name, handles)
     }
 
-    fn add_named(&mut self, kind: Kind, name: String, handles: Vec<Handle>) -> NodeId {
+    pub(crate) fn add_named(&mut self, kind: Kind, name: String, handles: Vec<Handle>) -> NodeId {
         let id = self.engine.add(kind);
         let mut open = HashSet::default();
         open.insert(t!("Geometry").into_owned());
@@ -878,7 +930,7 @@ impl Graph {
 
     /// Copies `id` right after itself: its kind, values, sections, group and
     /// every link into it. The copy owns no entities yet.
-    fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
+    pub(crate) fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
         let index = self.engine.nodes.iter().position(|node| node.id == id)?;
         let original = self.engine.nodes[index].clone();
         let ui = self.ui.get(&id)?.clone();
@@ -914,11 +966,13 @@ impl Graph {
     }
 
     /// Position of every step in the node sequence.
-    fn steps(&self) -> HashMap<NodeId, usize> {
+    pub(crate) fn steps(&self) -> HashMap<NodeId, usize> {
         Self::ranks(self.engine.nodes.iter().map(|node| (node.id, &node.kind)))
     }
 
-    fn ranks<'a>(nodes: impl Iterator<Item = (NodeId, &'a Kind)>) -> HashMap<NodeId, usize> {
+    pub(crate) fn ranks<'a>(
+        nodes: impl Iterator<Item = (NodeId, &'a Kind)>,
+    ) -> HashMap<NodeId, usize> {
         nodes
             .filter(|(_, kind)| !is_input(kind))
             .enumerate()
@@ -928,7 +982,7 @@ impl Graph {
 
     /// The links a node order would break: those that would read from a
     /// later step, or feed an input.
-    fn broken_links(&self, steps: &HashMap<NodeId, usize>) -> Vec<Link> {
+    pub(crate) fn broken_links(&self, steps: &HashMap<NodeId, usize>) -> Vec<Link> {
         let inputs: HashSet<NodeId> = self
             .engine
             .nodes
@@ -954,7 +1008,7 @@ impl Graph {
 
     /// Drops every link that no longer reads from an earlier step or from an
     /// input, so data only flows forward along the node sequence.
-    fn prune_links(&mut self) {
+    pub(crate) fn prune_links(&mut self) {
         let broken = self.broken_links(&self.steps());
         self.engine.links.retain(|link| {
             !broken
@@ -964,7 +1018,7 @@ impl Graph {
     }
 
     /// Forgets groups nothing belongs to any more.
-    fn prune_groups(&mut self) {
+    pub(crate) fn prune_groups(&mut self) {
         let used: HashSet<GroupId> = self.ui.values().filter_map(|ui| ui.group).collect();
         self.groups.retain(|group| used.contains(&group.id));
     }
@@ -1044,7 +1098,7 @@ impl Graph {
     }
 
     /// The links reading from `id`.
-    fn dependents(&self, id: NodeId) -> Vec<Link> {
+    pub(crate) fn dependents(&self, id: NodeId) -> Vec<Link> {
         self.engine
             .links
             .iter()
@@ -1196,7 +1250,7 @@ impl Graph {
 
     /// What `target` accepts: an operation's spec says so; an object row by
     /// the kind of value it holds now.
-    fn expect(&self, target: &Port, value: &Value) -> Expect {
+    pub(crate) fn expect(&self, target: &Port, value: &Value) -> Expect {
         match self.engine.node(target.node).map(|node| &node.kind) {
             Some(Kind::Op(spec)) => {
                 let Some(input) = spec.inputs.iter().find(|input| input.name == target.field)
@@ -2675,12 +2729,14 @@ impl Graph {
                 if let Some(snapshot) = self.undo.pop() {
                     self.redo.push(self.snapshot());
                     self.restore(snapshot);
+                    self.revision += 1;
                 }
             }
             GraphMsg::Redo => {
                 if let Some(snapshot) = self.redo.pop() {
                     self.undo.push(self.snapshot());
                     self.restore(snapshot);
+                    self.revision += 1;
                 }
             }
             _ => {}
