@@ -6440,6 +6440,7 @@ dock =
     .new-group = Uusi ryhmä
     .browser = Selain
     .node-graph = Solmukaavio
+    .node-sequence = Solmujono
 
 graphic-attributes =
     .title = Grafiikkamääritteet

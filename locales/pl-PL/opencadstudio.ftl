@@ -6442,6 +6442,7 @@ dock =
     .new-group = Nowa grupa
     .browser = Przeglądarka
     .node-graph = Graf węzłów
+    .node-sequence = Sekwencja węzłów
 
 graphic-attributes =
     .title = Atrybuty graficzne

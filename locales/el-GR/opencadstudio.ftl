@@ -6443,6 +6443,7 @@ dock =
     .new-group = Νέα ομάδα
     .browser = Περιηγητής
     .node-graph = Γράφος κόμβων
+    .node-sequence = Ακολουθία κόμβων
 
 graphic-attributes =
     .title = Γραφικά χαρακτηριστικά

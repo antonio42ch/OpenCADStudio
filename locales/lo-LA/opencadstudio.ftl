@@ -6444,6 +6444,7 @@ dock =
     .new-group = ກຸ່ມໃໝ່
     .browser = ບຣາວເຊີ
     .node-graph = ກຣາຟໂນດ
+    .node-sequence = ລຳດັບໂນດ
 
 graphic-attributes =
     .title = ຄຸນລັກສະນະກຣາຟິກ

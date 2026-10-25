@@ -6129,6 +6129,7 @@ pub(super) fn message_attribute(source: &str) -> Option<(&'static str, &'static 
         "New group" => Some(("dock", "new-group")),
         "Browser" => Some(("dock", "browser")),
         "Node Graph" => Some(("dock", "node-graph")),
+        "Node Sequence" => Some(("dock", "node-sequence")),
         "Graphic Attributes" => Some(("graphic-attributes", "title")),
         "Set all attributes ByLayer" => Some(("graphic-attributes", "set-all-bylayer")),
         "Set all attributes ByBlock" => Some(("graphic-attributes", "set-all-byblock")),

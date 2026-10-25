@@ -6444,6 +6444,7 @@ dock =
     .new-group = Новая группа
     .browser = Обозреватель
     .node-graph = Граф узлов
+    .node-sequence = Последовательность узлов
 
 graphic-attributes =
     .title = Графические атрибуты

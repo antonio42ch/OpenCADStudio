@@ -6443,6 +6443,7 @@ dock =
     .new-group = Nouveau groupe
     .browser = Navigateur
     .node-graph = Graphe de nœuds
+    .node-sequence = Séquence de nœuds
 
 graphic-attributes =
     .title = Attributs graphiques

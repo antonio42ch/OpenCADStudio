@@ -6427,6 +6427,7 @@ dock =
     .new-group = Új csoport
     .browser = Böngésző
     .node-graph = Csomópontgráf
+    .node-sequence = Csomópont-sorozat
 
 graphic-attributes =
     .title = Grafikus jellemzők

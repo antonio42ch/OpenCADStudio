@@ -6443,6 +6443,7 @@ dock =
     .new-group = Нова група
     .browser = Браузър
     .node-graph = Граф на възлите
+    .node-sequence = Последователност от възли
 
 graphic-attributes =
     .title = Графични атрибути

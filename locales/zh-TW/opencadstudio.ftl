@@ -6438,6 +6438,7 @@ dock =
     .new-group = 新增群組
     .browser = 瀏覽器
     .node-graph = 節點圖
+    .node-sequence = 節點序列
 
 graphic-attributes =
     .title = 圖形特性

@@ -6442,6 +6442,7 @@ dock =
     .new-group = 새 그룹
     .browser = 브라우저
     .node-graph = 노드 그래프
+    .node-sequence = 노드 시퀀스
 
 graphic-attributes =
     .title = 그래픽 속성

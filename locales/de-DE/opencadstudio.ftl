@@ -6441,6 +6441,7 @@ dock =
     .new-group = Neue Gruppe
     .browser = Browser
     .node-graph = Knotengraph
+    .node-sequence = Knotensequenz
 
 graphic-attributes =
     .title = Grafikattribute

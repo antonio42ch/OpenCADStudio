@@ -6426,6 +6426,7 @@ dock =
     .new-group = 新建组
     .browser = 浏览器
     .node-graph = 节点图
+    .node-sequence = 节点序列
 
 graphic-attributes =
     .title = 图形特性

@@ -6431,6 +6431,7 @@ dock =
     .new-group = नया समूह
     .browser = ब्राउज़र
     .node-graph = नोड ग्राफ़
+    .node-sequence = नोड अनुक्रम
 
 graphic-attributes =
     .title = ग्राफ़िक गुण

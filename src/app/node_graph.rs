@@ -5,7 +5,7 @@
 
 use super::{Message, OpenCADStudio};
 use crate::scene::model::object::PropSection;
-use crate::ui::node_graph::{Drag, GraphMsg, NodeRow, NodeSection, ObjectKind, RowWidget};
+use crate::ui::node_graph::{GraphMsg, NodeRow, NodeSection, ObjectKind, RowWidget};
 use codec::Handle;
 use graph::{Kind, NodeId, Port};
 use iced::Task;
@@ -180,6 +180,8 @@ impl OpenCADStudio {
 
     pub(super) fn on_graph(&mut self, message: GraphMsg) -> Task<Message> {
         let i = self.active_tab;
+        let owned_before = matches!(message, GraphMsg::Undo | GraphMsg::Redo)
+            .then(|| self.tabs[i].graph.owned_handles());
         self.tabs[i].graph.update_ui(&message);
         match message {
             GraphMsg::Toggle => {
@@ -192,50 +194,89 @@ impl OpenCADStudio {
                     return self.graph_run(i);
                 }
             }
-            GraphMsg::PaletteRelease => {
-                if let Some(Drag::Palette(item)) = self.tabs[i].graph.drag.take() {
-                    let pos = self.tabs[i].graph.drop_position(false);
-                    self.tabs[i].graph.add_node(item, Vec::new(), pos);
+            GraphMsg::Add(item) => {
+                self.tabs[i].graph.record();
+                self.tabs[i].graph.add_node(item, Vec::new());
+                return self.graph_run(i);
+            }
+            // The canvas already changed the graph; re-evaluate. A move held
+            // for confirmation changed nothing yet.
+            GraphMsg::Choose(_)
+            | GraphMsg::Unlink(_)
+            | GraphMsg::PickNewInput(..)
+            | GraphMsg::Move(..)
+            | GraphMsg::MoveNow(..) => {
+                if self.tabs[i].graph.confirm.is_none() {
                     return self.graph_run(i);
                 }
             }
-            GraphMsg::Released => {
-                let sections = self.graph_all_sections(i);
-                match self.tabs[i].graph.drag.take() {
-                    Some(Drag::Palette(item)) => {
-                        let pos = self.tabs[i].graph.drop_position(true);
-                        self.tabs[i].graph.add_node(item, Vec::new(), pos);
-                        return self.graph_run(i);
-                    }
-                    Some(Drag::Link(from)) => {
-                        if let Some(to) = self.tabs[i].graph.hit_input(&sections) {
-                            self.tabs[i].graph.engine.connect(from, to);
-                        }
-                        // A link dropped on nothing was detached from an input.
-                        return self.graph_run(i);
-                    }
-                    _ => {}
+            GraphMsg::ConfirmYes => {
+                if let Some(confirm) = self.tabs[i].graph.confirm.take() {
+                    return self.on_graph(confirm.action);
                 }
             }
-            GraphMsg::NodeDelete(id) => {
-                let graph = &mut self.tabs[i].graph;
-                graph.engine.remove(id);
-                graph.drafts.retain(|port, _| port.node != id);
-                let handles = graph
-                    .ui
-                    .remove(&id)
-                    .map(|ui| ui.handles)
-                    .unwrap_or_default();
-                return self.graph_step(i, |app| {
-                    let live: Vec<Handle> = handles
-                        .into_iter()
-                        .filter(|handle| app.tabs[i].scene.document.get_entity(*handle).is_some())
-                        .collect();
-                    if !live.is_empty() {
-                        app.tabs[i].scene.erase_entities(&live);
-                        app.tabs[i].dirty = true;
-                        app.refresh_properties();
+            GraphMsg::Duplicate(_) => {
+                // An object copy starts from its own copy of the original's
+                // first entity.
+                if let Some((original, copy)) = self.tabs[i].graph.duplicated.take() {
+                    let first = self.tabs[i]
+                        .graph
+                        .ui
+                        .get(&original)
+                        .and_then(|ui| ui.handles.first().copied());
+                    let entity = first
+                        .and_then(|handle| self.tabs[i].scene.document.get_entity(handle))
+                        .cloned();
+                    if let Some(mut entity) = entity {
+                        entity.common_mut().handle = Handle::NULL;
+                        if let Some(handle) = self.commit_entity_handle(entity) {
+                            self.tabs[i].dirty = true;
+                            if let Some(ui) = self.tabs[i].graph.ui.get_mut(&copy) {
+                                ui.handles = vec![handle];
+                            }
+                        }
                     }
+                }
+                return self.graph_run(i);
+            }
+            GraphMsg::Undo | GraphMsg::Redo => {
+                // Entities of nodes the step took away go with them; nodes it
+                // brought back recreate theirs on evaluation.
+                let owned = self.tabs[i].graph.owned_handles();
+                let dropped: Vec<Handle> = owned_before
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|handle| !owned.contains(handle))
+                    .collect();
+                return self.graph_step(i, |app| {
+                    app.graph_erase(i, dropped);
+                    Vec::new()
+                });
+            }
+            GraphMsg::FromSelection => return self.graph_from_selection(i),
+            GraphMsg::GroupRenameStart(_) => {
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    crate::ui::node_graph::RENAME_ID,
+                ));
+            }
+            GraphMsg::Pick(_) => {
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    crate::ui::node_graph::PICK_SEARCH_ID,
+                ));
+            }
+            GraphMsg::RenameStart(_) => {
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    crate::ui::node_graph::RENAME_ID,
+                ));
+            }
+            GraphMsg::NodeDelete(id) | GraphMsg::DeleteNow(id) => {
+                // A node others read from waits for confirmation.
+                if self.tabs[i].graph.confirm.is_some() {
+                    return Task::none();
+                }
+                let handles = self.tabs[i].graph.remove_node(id);
+                return self.graph_step(i, |app| {
+                    app.graph_erase(i, handles);
                     Vec::new()
                 });
             }
@@ -249,7 +290,9 @@ impl OpenCADStudio {
                 return self.graph_set(i, port, value);
             }
             GraphMsg::Set(port, value) => return self.graph_set(i, port, value),
-            GraphMsg::New => self.tabs[i].graph = Default::default(),
+            GraphMsg::New => {
+                self.tabs[i].graph.clear();
+            }
             GraphMsg::Save => {
                 // The file names the drawing by its fingerprint so reopening it
                 // elsewhere cannot take over unrelated entities; a drawing that
@@ -339,6 +382,68 @@ impl OpenCADStudio {
             _ => {}
         }
         Task::none()
+    }
+
+    /// Adopts the selected drawing entities: one object node each, owning
+    /// the entity as drawn. Entities another node owns, and kinds no node
+    /// can own, are skipped and counted.
+    fn graph_from_selection(&mut self, i: usize) -> Task<Message> {
+        let tab = &self.tabs[i];
+        let owned = tab.graph.owned_handles();
+        let mut selected: Vec<Handle> = tab.scene.selected.iter().copied().collect();
+        selected.sort_by_key(|handle| handle.value());
+        let (mut picked, mut taken, mut unsupported) = (Vec::new(), 0, 0);
+        for handle in selected {
+            let Some(entity) = tab.scene.document.get_entity(handle) else {
+                continue;
+            };
+            match ObjectKind::of(entity) {
+                _ if owned.contains(&handle) => taken += 1,
+                Some(kind) => picked.push((kind, handle)),
+                None => unsupported += 1,
+            }
+        }
+        if taken > 0 {
+            self.command_line
+                .push_info(crate::tf!("{} objects already belong to a node", taken).as_ref());
+        }
+        if unsupported > 0 {
+            self.command_line.push_info(
+                crate::tf!("{} objects are of a kind nodes cannot hold", unsupported).as_ref(),
+            );
+        }
+        if picked.is_empty() {
+            self.command_line.push_error(
+                crate::t!("Select lines, circles, arcs, ellipses, points, polylines, rays, construction lines or texts in the drawing first").as_ref(),
+            );
+            return Task::none();
+        }
+        let graph = &mut self.tabs[i].graph;
+        graph.record();
+        graph.steps_hidden = false;
+        let count = picked.len();
+        for (kind, handle) in picked {
+            graph.add_node(
+                crate::ui::node_graph::PaletteItem::Object(kind),
+                vec![handle],
+            );
+        }
+        self.command_line
+            .push_output(crate::tf!("{} nodes added from the drawing", count).as_ref());
+        self.graph_run(i)
+    }
+
+    /// Erases the entities in `handles` that still exist.
+    fn graph_erase(&mut self, i: usize, handles: Vec<Handle>) {
+        let live: Vec<Handle> = handles
+            .into_iter()
+            .filter(|handle| self.tabs[i].scene.document.get_entity(*handle).is_some())
+            .collect();
+        if !live.is_empty() {
+            self.tabs[i].scene.erase_entities(&live);
+            self.tabs[i].dirty = true;
+            self.refresh_properties();
+        }
     }
 
     /// An edited input: an operation keeps it as a parameter; an object node

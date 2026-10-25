@@ -6450,6 +6450,7 @@ dock =
     .new-group = Nhóm mới
     .browser = Trình duyệt
     .node-graph = Đồ thị nút
+    .node-sequence = Chuỗi nút
 
 graphic-attributes =
     .title = Thuộc tính đồ họa

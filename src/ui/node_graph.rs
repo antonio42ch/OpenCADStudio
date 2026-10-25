@@ -1,23 +1,28 @@
 //! Node graph overlay over the viewport.
 //!
 //! The graph itself — nodes, links, evaluation, the operation library — is the
-//! `graph` crate. This module is its canvas: the palette, node cards, wires
-//! and dragging. Object nodes own drawing entities, and their rows are the
-//! Properties panel's own rows for that entity (built and written back in
+//! `graph` crate. This module is its canvas: the palette, the Inputs area, the
+//! node sequence of steps and the value picker. There are no wires: every input of
+//! a step takes its value from an earlier step or from the Inputs area through
+//! the picker, and the Inputs area is the only place values are typed by hand.
+//! Nodes can be gathered into named, coloured, collapsible groups, and every
+//! structural edit goes on the graph's own undo history.
+//! Object nodes own drawing entities, and their rows are the Properties
+//! panel's own rows for that entity (built and written back in
 //! `app::node_graph`); operation rows come from the node's spec.
 
 use codec::{EntityType, Handle};
-use graph::{Kind, NodeId, Port, Spec};
+use graph::{Kind, Link, NodeId, Port, Spec};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
-use iced::advanced::{renderer, Renderer as _, Shell};
+use iced::advanced::{overlay, renderer, Renderer as _, Shell};
 use iced::widget::{
-    button, canvas, checkbox, column, container, mouse_area, opaque, pin, row, scrollable, slider,
-    stack, text, text_input, Space,
+    button, center, checkbox, column, container, mouse_area, opaque, pick_list, row, scrollable,
+    slider, stack, text, text_input, tooltip, Space,
 };
 use iced::{
-    mouse, Background, Border, Element, Length, Point, Rectangle, Size, Theme, Transformation,
-    Vector,
+    mouse, Background, Border, Color, Element, Length, Point, Rectangle, Shadow, Size, Theme,
+    Transformation, Vector,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use serde_json::{json, Value};
@@ -25,15 +30,35 @@ use serde_json::{json, Value};
 use crate::app::Message;
 use crate::t;
 
-pub const NODE_W: f32 = 280.0;
-const HEADER_H: f32 = 26.0;
-const SECTION_H: f32 = 22.0;
-const ROW_H: f32 = 22.0;
+pub const NODE_W: f32 = 300.0;
+const INPUTS_W: f32 = 290.0;
 const LABEL_W: f32 = 96.0;
-const PORT_W: f32 = 14.0;
-const PORT_HIT: f32 = 10.0;
-const ZOOM_STEP: f32 = 1.1;
-const ZOOM_STEPS: std::ops::RangeInclusive<i32> = -15..=12;
+const PICKER_W: f32 = 440.0;
+const ZOOM_STEP: f32 = 1.15;
+const ZOOM_STEPS: std::ops::RangeInclusive<i32> = -8..=8;
+/// The `NodeUi::open` key of a step's computed-values group; no section
+/// title can clash with it.
+const COMPUTED_SECTION: &str = "\u{1}computed";
+/// Undo steps the graph keeps.
+const HISTORY: usize = 100;
+/// Text inputs the app focuses when the picker or a rename opens.
+pub const PICK_SEARCH_ID: &str = "node-graph-pick-search";
+pub const RENAME_ID: &str = "node-graph-rename";
+
+/// Operations that live in the Inputs area: the only nodes whose values are
+/// typed by hand.
+const INPUT_KINDS: &[&str] = &[
+    "Number",
+    "Number Slider",
+    "Integer Slider",
+    "Text",
+    "Boolean",
+];
+
+/// Whether `kind` is an Inputs-area node rather than a step of the node sequence.
+pub fn is_input(kind: &Kind) -> bool {
+    matches!(kind, Kind::Op(spec) if INPUT_KINDS.contains(&spec.name))
+}
 
 /// Drawing objects a node can create.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,6 +107,11 @@ impl ObjectKind {
 
     pub fn from_name(name: &str) -> Option<Self> {
         OBJECTS.iter().copied().find(|kind| kind.name() == name)
+    }
+
+    /// The kind of a drawn entity, when a node can own it.
+    pub fn of(entity: &EntityType) -> Option<Self> {
+        OBJECTS.iter().copied().find(|kind| kind.matches(entity))
     }
 
     /// Whether `entity` is this kind of object.
@@ -151,9 +181,9 @@ impl ObjectKind {
             ObjectKind::Text => {
                 EntityType::Text(e::Text::with_value("Text", origin).with_height(2.5))
             }
-            ObjectKind::MText => {
-                EntityType::MText(Box::new(e::MText::with_value("MText", origin).with_height(2.5)))
-            }
+            ObjectKind::MText => EntityType::MText(Box::new(
+                e::MText::with_value("MText", origin).with_height(2.5),
+            )),
         }
     }
 }
@@ -174,13 +204,31 @@ impl PaletteItem {
     }
 }
 
+pub type GroupId = u32;
+
 /// Canvas state of one node.
+#[derive(Clone)]
 pub struct NodeUi {
-    pub pos: Point,
+    /// The user's name for the node, unique within the graph, so the picker
+    /// tells apart several nodes of the same type.
+    pub name: String,
     /// Expanded section titles; a new object node opens only Geometry.
     pub open: HashSet<String>,
     /// Entities an object node owns, one per list element.
     pub handles: Vec<Handle>,
+    pub group: Option<GroupId>,
+}
+
+/// A named run of steps in the node sequence, or of cards in the Inputs area.
+#[derive(Clone, Debug)]
+pub struct NodeGroup {
+    pub id: GroupId,
+    pub name: String,
+    /// Index into the accent colours.
+    pub color: usize,
+    pub collapsed: bool,
+    /// Whether it gathers inputs rather than steps.
+    pub inputs: bool,
 }
 
 pub enum RowWidget {
@@ -204,48 +252,172 @@ pub struct NodeRow {
     pub widget: RowWidget,
 }
 
-pub enum Drag {
-    Palette(PaletteItem),
-    Node(NodeId, Vector),
-    Link(Port),
-    Pan(Point, Vector),
+/// What a rename is renaming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Renaming {
+    Node(NodeId),
+    Group(GroupId),
+}
+
+/// An edit that would break links, held until the user confirms it.
+#[derive(Clone, Debug)]
+pub struct Confirm {
+    /// Applied on confirmation.
+    pub action: GraphMsg,
+    /// The node being deleted or moved.
+    pub node: NodeId,
+    pub delete: bool,
+    /// Links the edit removes.
+    pub links: Vec<Link>,
+}
+
+/// Everything an undo step restores.
+#[derive(Clone)]
+struct Snapshot {
+    engine: graph::Graph,
+    ui: HashMap<NodeId, NodeUi>,
+    groups: Vec<NodeGroup>,
+}
+
+/// The kind of value an input expects, so the picker can dim the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Expect {
+    Any,
+    Number,
+    Text,
+    Bool,
+    Point,
+    Object,
+}
+
+impl Expect {
+    fn of_value(value: &Value) -> Self {
+        match value {
+            Value::Number(_) => Expect::Number,
+            Value::String(_) => Expect::Text,
+            Value::Bool(_) => Expect::Bool,
+            Value::Object(object) if object.contains_key("handle") => Expect::Object,
+            Value::Object(_) if graph::value::point(value).is_some() => Expect::Point,
+            _ => Expect::Any,
+        }
+    }
+
+    /// Whether `value` can feed this input; a list feeds it element-wise.
+    fn fits(self, value: &Value) -> bool {
+        match value {
+            Value::Null => true,
+            Value::Array(items) => items.first().is_none_or(|item| self.fits(item)),
+            _ => match self {
+                Expect::Any => true,
+                Expect::Number => {
+                    value.is_number()
+                        || value
+                            .as_str()
+                            .is_some_and(|text| text.trim().parse::<f64>().is_ok())
+                }
+                Expect::Text => value.is_string() || value.is_number() || value.is_boolean(),
+                Expect::Bool => value.is_boolean(),
+                Expect::Point => graph::value::point(value).is_some(),
+                Expect::Object => value.get("handle").is_some(),
+            },
+        }
+    }
+
+    fn label(self) -> Option<&'static str> {
+        match self {
+            Expect::Any => None,
+            Expect::Number => Some("Expects a number"),
+            Expect::Text => Some("Expects text"),
+            Expect::Bool => Some("Expects true or false"),
+            Expect::Point => Some("Expects a point"),
+            Expect::Object => Some("Expects an object"),
+        }
+    }
+
+    /// The input node a new value for this input starts as.
+    fn input_kind(self) -> Option<&'static str> {
+        match self {
+            Expect::Any | Expect::Number => Some("Number"),
+            Expect::Text => Some("Text"),
+            Expect::Bool => Some("Boolean"),
+            Expect::Point | Expect::Object => None,
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct Graph {
+    /// Node order is the node sequence order of the steps; Inputs-area nodes keep
+    /// their own relative order among them.
     pub engine: graph::Graph,
     pub ui: HashMap<NodeId, NodeUi>,
-    pub pan: Vector,
-    /// Wheel steps; the scale is `ZOOM_STEP ^ zoom_steps`.
-    zoom_steps: i32,
-    pub cursor: Point,
-    pub drag: Option<Drag>,
+    pub groups: Vec<NodeGroup>,
     pub drafts: HashMap<Port, String>,
+    /// The step input whose source the value picker is choosing.
+    pub picking: Option<Port>,
+    /// Filter typed into the picker's search box.
+    pick_search: String,
+    /// What is being renamed and its draft name.
+    pub renaming: Option<(Renaming, String)>,
+    /// An edit waiting for the user to accept the links it breaks.
+    pub confirm: Option<Confirm>,
+    /// The last duplication, `(original, copy)`, for the app to give the copy
+    /// its own entities.
+    pub duplicated: Option<(NodeId, NodeId)>,
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// The input a run of slider moves is recording into, so a drag is one
+    /// undo step.
+    recording: Option<Port>,
     /// Categories the user has flipped from their initial state: Objects
     /// starts open, the rest closed.
     toggled_categories: HashSet<&'static str>,
     /// Filter typed into the panel's search box.
     search: String,
+    /// Node sequence zoom in steps; the scale is `ZOOM_STEP ^ zoom_steps`.
+    zoom_steps: i32,
+    /// Only the Inputs area shows, so the drawing stays visible while the
+    /// inputs are tuned.
+    pub steps_hidden: bool,
 }
 
 #[derive(Debug, Clone)]
 pub enum GraphMsg {
     Toggle,
     Category(&'static str),
-    PalettePress(PaletteItem),
-    Moved(Point),
-    Pressed,
-    Released,
-    NodePress(NodeId),
+    /// A palette entry was clicked: inputs join the Inputs area, everything
+    /// else the end of the node sequence.
+    Add(PaletteItem),
+    /// Asks to delete a node; one other nodes read from asks first.
     NodeDelete(NodeId),
+    /// Deletes a node without asking.
+    DeleteNow(NodeId),
+    /// Copies a node, its values and what feeds it, right after itself.
+    Duplicate(NodeId),
+    /// Moves a node one place earlier (-1) or later (+1) among its kind; one
+    /// that would break links asks first.
+    Move(NodeId, i32),
+    MoveNow(NodeId, i32),
     Section(NodeId, String),
-    OutPress(Port),
-    InPress(Port),
+    RenameStart(NodeId),
+    GroupRenameStart(GroupId),
+    RenameInput(String),
+    RenameCommit,
+    /// Opens the value picker for a step input.
+    Pick(Port),
+    PickSearch(String),
+    PickCancel,
+    /// The picker chose this output for the input being picked.
+    Choose(Port),
+    /// Creates an input node of this kind holding this value and feeds the
+    /// input being picked from it.
+    PickNewInput(&'static str, Value),
+    /// Clears what feeds a step input; it falls back to its own value.
+    Unlink(Port),
     Input(Port, String),
     Commit(Port),
-    /// A slider or toggle set an operation input.
+    /// A slider or toggle set an input value.
     Set(Port, Value),
-    Zoom(mouse::ScrollDelta),
     /// Start an empty graph; the drawing keeps the old graph's objects.
     New,
     Save,
@@ -253,9 +425,26 @@ pub enum GraphMsg {
     Saved(Option<Result<String, String>>),
     Open,
     Loaded(Option<Vec<u8>>),
-    /// The button was released over the panel entry it was pressed on.
-    PaletteRelease,
     Search(String),
+    /// Zooms the node sequence by this many steps; 0 resets it.
+    Zoom(i32),
+    /// Shows or hides the node sequence, leaving only the Inputs area.
+    ToggleSteps,
+    /// Adds an object node for each selected drawing entity, owning it as
+    /// drawn.
+    FromSelection,
+    /// Starts a group holding this node.
+    GroupNew(NodeId),
+    GroupAssign(NodeId, Option<GroupId>),
+    GroupCollapse(GroupId),
+    /// Gives a group the next accent colour.
+    GroupColor(GroupId),
+    /// Dissolves a group; its nodes stay where they are.
+    GroupDelete(GroupId),
+    Undo,
+    Redo,
+    ConfirmYes,
+    ConfirmNo,
 }
 
 fn msg(m: GraphMsg) -> Message {
@@ -283,28 +472,153 @@ pub fn display(value: &Value) -> String {
     }
 }
 
+/// The type name shown under a node's own name.
+fn kind_name(kind: &Kind) -> String {
+    match kind {
+        Kind::Op(spec) => t!(spec.name).into_owned(),
+        Kind::Object(name) => t!(name.as_str()).into_owned(),
+    }
+}
+
+fn weak_text(theme: &Theme) -> text::Style {
+    let palette = theme.palette();
+    text::Style {
+        color: Some(palette.background.base.text.scale_alpha(0.6)),
+    }
+}
+
+fn card_style(theme: &Theme) -> container::Style {
+    let palette = theme.palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.base.color)),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::BLACK.scale_alpha(0.15),
+            offset: Vector::new(0.0, 2.0),
+            blur_radius: 6.0,
+        },
+        ..Default::default()
+    }
+}
+
+fn header_style(theme: &Theme) -> container::Style {
+    let palette = theme.palette();
+    container::Style {
+        background: Some(Background::Color(palette.primary.weak.color)),
+        text_color: Some(palette.primary.weak.text),
+        border: Border {
+            radius: iced::border::top(6.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Accent colours telling nodes and groups apart: a node keeps its colour on
+/// its card, in the value picker and beside every row that reads from it.
+const NODE_COLORS: [Color; 8] = [
+    Color::from_rgb8(0x3B, 0x82, 0xF6),
+    Color::from_rgb8(0x10, 0xB9, 0x81),
+    Color::from_rgb8(0xF5, 0x9E, 0x0B),
+    Color::from_rgb8(0xEF, 0x44, 0x44),
+    Color::from_rgb8(0x8B, 0x5C, 0xF6),
+    Color::from_rgb8(0x06, 0xB6, 0xD4),
+    Color::from_rgb8(0xEC, 0x48, 0x99),
+    Color::from_rgb8(0x84, 0xCC, 0x16),
+];
+
+/// A node's accent colour, stable while it lives.
+pub fn node_color(id: NodeId) -> Color {
+    NODE_COLORS[(id.saturating_sub(1) as usize) % NODE_COLORS.len()]
+}
+
+fn group_color(group: &NodeGroup) -> Color {
+    NODE_COLORS[group.color % NODE_COLORS.len()]
+}
+
+/// A round chip in `color`: the step number, or a plain dot for an input.
+fn badge<'a>(color: Color, label: Option<String>) -> Element<'a, Message> {
+    let size = if label.is_some() { 22.0 } else { 12.0 };
+    container(text(label.unwrap_or_default()).size(11))
+        .center_x(size)
+        .center_y(size)
+        .style(move |_: &Theme| container::Style {
+            background: Some(Background::Color(color)),
+            text_color: Some(Color::WHITE),
+            border: Border {
+                radius: (size * 0.5).into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// Where a node comes from, as the picker tags its group.
+fn kind_tag(kind: &Kind) -> String {
+    match kind {
+        _ if is_input(kind) => t!("Input").into_owned(),
+        Kind::Op(spec) => t!(spec.category).into_owned(),
+        Kind::Object(_) => t!("Object").into_owned(),
+    }
+}
+
+/// A small icon button with a tooltip; `None` shows it disabled.
+fn icon_button<'a>(
+    icon: &'static [u8],
+    tip: &str,
+    message: Option<GraphMsg>,
+) -> Element<'a, Message> {
+    let icon = if message.is_some() {
+        crate::ui::icons::themed(icon, 10.0)
+    } else {
+        crate::ui::icons::themed_disabled(icon, 10.0)
+    };
+    let button = button(icon)
+        .on_press_maybe(message.map(msg))
+        .style(button::text)
+        .padding([5, 6]);
+    tooltip(
+        button,
+        container(text(t!(tip).into_owned()).size(10))
+            .padding([2, 6])
+            .style(container::bordered_box),
+        tooltip::Position::Top,
+    )
+    .gap(4)
+    .into()
+}
+
+/// A choice in a card's group list.
+#[derive(Clone, Debug, PartialEq)]
+enum GroupChoice {
+    None,
+    Join(GroupId, String),
+    New,
+}
+
+impl std::fmt::Display for GroupChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GroupChoice::None => f.write_str(&t!("No group")),
+            GroupChoice::Join(_, name) => f.write_str(name),
+            GroupChoice::New => f.write_str(&t!("New group…")),
+        }
+    }
+}
+
 impl Graph {
     fn zoom(&self) -> f32 {
         ZOOM_STEP.powi(self.zoom_steps)
     }
 
-    /// Screen point → graph coordinates.
-    fn to_graph(&self, screen: Point) -> Point {
-        let zoom = self.zoom();
-        Point::new(
-            (screen.x - self.pan.x) / zoom,
-            (screen.y - self.pan.y) / zoom,
-        )
-    }
-
-    /// Graph coordinates → screen point.
-    fn to_screen(&self, graph: Point) -> Point {
-        let zoom = self.zoom();
-        Point::new(self.pan.x + graph.x * zoom, self.pan.y + graph.y * zoom)
-    }
-
     /// The `.ocg` file: the graph, the canvas, and the fingerprint of the
-    /// drawing its object nodes' entities live in.
+    /// drawing its object nodes' entities live in. The graph's node order is
+    /// the node sequence order.
     pub fn to_file(&self, drawing: &str) -> Vec<u8> {
         let nodes: serde_json::Map<String, Value> = self
             .ui
@@ -315,16 +629,34 @@ impl Graph {
                 let handles: Vec<u64> = ui.handles.iter().map(|handle| handle.value()).collect();
                 (
                     id.to_string(),
-                    json!({ "pos": [ui.pos.x, ui.pos.y], "open": open, "handles": handles }),
+                    json!({ "name": ui.name, "open": open, "handles": handles, "group": ui.group }),
                 )
+            })
+            .collect();
+        let groups: Vec<Value> = self
+            .groups
+            .iter()
+            .map(|group| {
+                json!({
+                    "id": group.id,
+                    "name": group.name,
+                    "color": group.color,
+                    "collapsed": group.collapsed,
+                    "inputs": group.inputs,
+                })
             })
             .collect();
         let file = json!({
             "format": "ocg",
-            "version": 1,
+            "version": 2,
             "drawing": drawing,
             "graph": self.engine.to_json(),
-            "canvas": { "pan": [self.pan.x, self.pan.y], "zoom": self.zoom_steps, "nodes": nodes },
+            "canvas": {
+                "zoom": self.zoom_steps,
+                "steps_hidden": self.steps_hidden,
+                "groups": groups,
+                "nodes": nodes,
+            },
         });
         serde_json::to_vec_pretty(&file).unwrap_or_default()
     }
@@ -340,22 +672,42 @@ impl Graph {
             engine: graph::Graph::from_json(&file["graph"])?,
             ..Graph::default()
         };
+        // Version 1 graphs were wired freely on a canvas, so their node order
+        // means nothing; lay their steps out in dataflow order instead.
+        if file["version"].as_u64().unwrap_or(1) < 2 {
+            let order = graph.engine.order();
+            graph.engine.nodes.sort_by_key(|node| {
+                order
+                    .iter()
+                    .position(|id| *id == node.id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
         let canvas = &file["canvas"];
-        let pair = |value: &Value| {
-            Some(Vector::new(
-                value[0].as_f64()? as f32,
-                value[1].as_f64()? as f32,
-            ))
-        };
-        graph.pan = pair(&canvas["pan"]).unwrap_or_default();
         graph.zoom_steps = canvas["zoom"].as_i64().map_or(0, |steps| {
             (steps as i32).clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end())
         });
-        let ids: Vec<NodeId> = graph.engine.nodes.iter().map(|node| node.id).collect();
-        for (index, id) in ids.into_iter().enumerate() {
+        graph.steps_hidden = canvas["steps_hidden"].as_bool().unwrap_or(false);
+        for group in canvas["groups"].as_array().into_iter().flatten() {
+            let (Some(id), Some(name)) = (group["id"].as_u64(), group["name"].as_str()) else {
+                continue;
+            };
+            graph.groups.push(NodeGroup {
+                id: id as GroupId,
+                name: name.to_owned(),
+                color: group["color"].as_u64().unwrap_or(0) as usize,
+                collapsed: group["collapsed"].as_bool().unwrap_or(false),
+                inputs: group["inputs"].as_bool().unwrap_or(false),
+            });
+        }
+        let ids: Vec<(NodeId, String, bool)> = graph
+            .engine
+            .nodes
+            .iter()
+            .map(|node| (node.id, kind_name(&node.kind), is_input(&node.kind)))
+            .collect();
+        for (id, kind, input) in ids {
             let saved = &canvas["nodes"][id.to_string()];
-            let step = (index % 6) as f32 * 30.0;
-            let pos = pair(&saved["pos"]).unwrap_or(Vector::new(40.0 + step, 40.0 + step));
             let open: HashSet<String> = match saved["open"].as_array() {
                 Some(titles) => titles
                     .iter()
@@ -373,41 +725,355 @@ impl Graph {
                         .collect()
                 })
                 .unwrap_or_default();
+            let name = match saved["name"].as_str().map(str::trim) {
+                Some(name) if !name.is_empty() => graph.unique_name(name, None, false),
+                _ => graph.unique_name(&kind, None, true),
+            };
+            // A group only holds nodes of its own area.
+            let group = saved["group"]
+                .as_u64()
+                .map(|group| group as GroupId)
+                .filter(|group| {
+                    graph
+                        .groups
+                        .iter()
+                        .any(|known| known.id == *group && known.inputs == input)
+                });
             graph.ui.insert(
                 id,
                 NodeUi {
-                    pos: Point::ORIGIN + pos,
+                    name,
                     open,
                     handles,
+                    group,
                 },
             );
         }
+        graph.prune_links();
+        graph.prune_groups();
         Ok((
             graph,
             file["drawing"].as_str().unwrap_or_default().to_owned(),
         ))
     }
 
-    pub fn add_node(&mut self, item: PaletteItem, handles: Vec<Handle>, pos: Point) -> NodeId {
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            engine: self.engine.clone(),
+            ui: self.ui.clone(),
+            groups: self.groups.clone(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: Snapshot) {
+        self.engine = snapshot.engine;
+        self.ui = snapshot.ui;
+        self.groups = snapshot.groups;
+        self.picking = None;
+        self.renaming = None;
+        self.confirm = None;
+        self.drafts.clear();
+        self.recording = None;
+    }
+
+    /// Saves the graph as an undo step before an edit.
+    pub fn record(&mut self) {
+        self.undo.push(self.snapshot());
+        if self.undo.len() > HISTORY {
+            self.undo.remove(0);
+        }
+        self.redo.clear();
+        self.recording = None;
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo.is_empty()
+    }
+
+    /// Every entity some node owns.
+    pub fn owned_handles(&self) -> Vec<Handle> {
+        self.ui
+            .values()
+            .flat_map(|ui| ui.handles.iter().copied())
+            .collect()
+    }
+
+    /// Empties the graph as one undo step.
+    pub fn clear(&mut self) {
+        self.record();
+        self.engine = graph::Graph::default();
+        self.ui.clear();
+        self.groups.clear();
+        self.picking = None;
+        self.renaming = None;
+        self.confirm = None;
+        self.drafts.clear();
+    }
+
+    fn taken(&self, name: &str, except: Option<NodeId>) -> bool {
+        let name = name.to_lowercase();
+        self.ui
+            .iter()
+            .any(|(id, ui)| Some(*id) != except && ui.name.to_lowercase() == name)
+    }
+
+    /// `base` itself when free (and not `numbered`), else `base 2`, `base 3`…
+    /// A numbered default starts at `base 1`.
+    fn unique_name(&self, base: &str, except: Option<NodeId>, numbered: bool) -> String {
+        if !numbered && !self.taken(base, except) {
+            return base.to_owned();
+        }
+        (if numbered { 1 } else { 2 }..)
+            .map(|n| format!("{base} {n}"))
+            .find(|name| !self.taken(name, except))
+            .unwrap_or_default()
+    }
+
+    /// A node's own name.
+    pub fn name(&self, id: NodeId) -> String {
+        self.ui
+            .get(&id)
+            .map(|ui| ui.name.clone())
+            .unwrap_or_default()
+    }
+
+    fn group(&self, id: GroupId) -> Option<&NodeGroup> {
+        self.groups.iter().find(|group| group.id == id)
+    }
+
+    fn node_group(&self, id: NodeId) -> Option<GroupId> {
+        self.ui.get(&id).and_then(|ui| ui.group)
+    }
+
+    /// Adds a node: an input joins the Inputs area, anything else the end of
+    /// the node sequence.
+    pub fn add_node(&mut self, item: PaletteItem, handles: Vec<Handle>) -> NodeId {
         let kind = match item {
             PaletteItem::Object(kind) => Kind::Object(kind.name().to_owned()),
             PaletteItem::Op(spec) => Kind::Op(spec),
         };
+        let name = self.unique_name(&kind_name(&kind), None, true);
+        self.add_named(kind, name, handles)
+    }
+
+    fn add_named(&mut self, kind: Kind, name: String, handles: Vec<Handle>) -> NodeId {
         let id = self.engine.add(kind);
         let mut open = HashSet::default();
         open.insert(t!("Geometry").into_owned());
-        self.ui.insert(id, NodeUi { pos, open, handles });
+        self.ui.insert(
+            id,
+            NodeUi {
+                name,
+                open,
+                handles,
+                group: None,
+            },
+        );
         id
     }
 
-    /// Where a palette entry lands: under the cursor when dropped on the
-    /// canvas, staggered near the top-left when clicked in the panel.
-    pub fn drop_position(&self, on_canvas: bool) -> Point {
-        if on_canvas {
-            return self.to_graph(self.cursor);
+    /// Copies `id` right after itself: its kind, values, sections, group and
+    /// every link into it. The copy owns no entities yet.
+    fn duplicate(&mut self, id: NodeId) -> Option<NodeId> {
+        let index = self.engine.nodes.iter().position(|node| node.id == id)?;
+        let original = self.engine.nodes[index].clone();
+        let ui = self.ui.get(&id)?.clone();
+        let name = self.unique_name(&ui.name, None, false);
+        let copy = self.add_named(original.kind, name, Vec::new());
+        if let Some(node) = self.engine.nodes.pop() {
+            self.engine.nodes.insert(index + 1, node);
         }
-        let step = (self.engine.nodes.len() % 6) as f32 * 30.0;
-        self.to_graph(Point::new(40.0 + step, 40.0 + step))
+        if let Some(node) = self.engine.node_mut(copy) {
+            node.params = original.params;
+        }
+        if let Some(copy_ui) = self.ui.get_mut(&copy) {
+            copy_ui.open = ui.open;
+            copy_ui.group = ui.group;
+        }
+        let incoming: Vec<Link> = self
+            .engine
+            .links
+            .iter()
+            .filter(|link| link.to.node == id)
+            .cloned()
+            .collect();
+        for link in incoming {
+            self.engine.connect(
+                link.from,
+                Port {
+                    node: copy,
+                    field: link.to.field,
+                },
+            );
+        }
+        Some(copy)
+    }
+
+    /// Position of every step in the node sequence.
+    fn steps(&self) -> HashMap<NodeId, usize> {
+        Self::ranks(self.engine.nodes.iter().map(|node| (node.id, &node.kind)))
+    }
+
+    fn ranks<'a>(nodes: impl Iterator<Item = (NodeId, &'a Kind)>) -> HashMap<NodeId, usize> {
+        nodes
+            .filter(|(_, kind)| !is_input(kind))
+            .enumerate()
+            .map(|(index, (id, _))| (id, index))
+            .collect()
+    }
+
+    /// The links a node order would break: those that would read from a
+    /// later step, or feed an input.
+    fn broken_links(&self, steps: &HashMap<NodeId, usize>) -> Vec<Link> {
+        let inputs: HashSet<NodeId> = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| is_input(&node.kind))
+            .map(|node| node.id)
+            .collect();
+        self.engine
+            .links
+            .iter()
+            .filter(|link| {
+                if inputs.contains(&link.to.node) {
+                    return true;
+                }
+                match (steps.get(&link.from.node), steps.get(&link.to.node)) {
+                    (Some(from), Some(to)) => from >= to,
+                    _ => !inputs.contains(&link.from.node),
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Drops every link that no longer reads from an earlier step or from an
+    /// input, so data only flows forward along the node sequence.
+    fn prune_links(&mut self) {
+        let broken = self.broken_links(&self.steps());
+        self.engine.links.retain(|link| {
+            !broken
+                .iter()
+                .any(|gone| gone.from == link.from && gone.to == link.to)
+        });
+    }
+
+    /// Forgets groups nothing belongs to any more.
+    fn prune_groups(&mut self) {
+        let used: HashSet<GroupId> = self.ui.values().filter_map(|ui| ui.group).collect();
+        self.groups.retain(|group| used.contains(&group.id));
+    }
+
+    /// Indices in `engine.nodes` of the nodes in `id`'s area.
+    fn area(&self, id: NodeId) -> Vec<usize> {
+        let input = self
+            .engine
+            .node(id)
+            .is_some_and(|node| is_input(&node.kind));
+        self.engine
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| is_input(&node.kind) == input)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// What moving `id` one place does: crossing into a neighbouring group
+    /// (or out of its own) first changes its group in place, so groups stay
+    /// together; otherwise it swaps with that neighbour.
+    fn plan_move(&self, id: NodeId, direction: i32) -> Option<Result<usize, Option<GroupId>>> {
+        let area = self.area(id);
+        let k = area
+            .iter()
+            .position(|index| self.engine.nodes[*index].id == id)?;
+        let neighbour = *k
+            .checked_add_signed(direction as isize)
+            .and_then(|k| area.get(k))?;
+        let other = self.node_group(self.engine.nodes[neighbour].id);
+        if other != self.node_group(id) {
+            return Some(Err(other));
+        }
+        Some(Ok(neighbour))
+    }
+
+    /// Links a move would break.
+    fn move_breaks(&self, id: NodeId, direction: i32) -> Vec<Link> {
+        let Some(Ok(neighbour)) = self.plan_move(id, direction) else {
+            return Vec::new();
+        };
+        let Some(index) = self.engine.nodes.iter().position(|node| node.id == id) else {
+            return Vec::new();
+        };
+        let mut order: Vec<(NodeId, &Kind)> = self
+            .engine
+            .nodes
+            .iter()
+            .map(|node| (node.id, &node.kind))
+            .collect();
+        order.swap(index, neighbour);
+        self.broken_links(&Self::ranks(order.into_iter()))
+    }
+
+    fn move_node(&mut self, id: NodeId, direction: i32) {
+        match self.plan_move(id, direction) {
+            Some(Ok(neighbour)) => {
+                if let Some(index) = self.engine.nodes.iter().position(|node| node.id == id) {
+                    self.engine.nodes.swap(index, neighbour);
+                }
+                self.prune_links();
+            }
+            Some(Err(group)) => {
+                if let Some(ui) = self.ui.get_mut(&id) {
+                    ui.group = group;
+                }
+                self.prune_groups();
+            }
+            None => {}
+        }
+    }
+
+    /// Whether `id` can move that way at all.
+    fn can_move(&self, id: NodeId, direction: i32) -> bool {
+        self.plan_move(id, direction).is_some()
+    }
+
+    /// The links reading from `id`.
+    fn dependents(&self, id: NodeId) -> Vec<Link> {
+        self.engine
+            .links
+            .iter()
+            .filter(|link| link.from.node == id)
+            .cloned()
+            .collect()
+    }
+
+    fn new_group(&mut self, id: NodeId) {
+        let input = self
+            .engine
+            .node(id)
+            .is_some_and(|node| is_input(&node.kind));
+        let group = self.groups.iter().map(|group| group.id).max().unwrap_or(0) + 1;
+        let name = (1..)
+            .map(|n| format!("{} {n}", t!("Group")))
+            .find(|name| !self.groups.iter().any(|group| &group.name == name))
+            .unwrap_or_default();
+        self.groups.push(NodeGroup {
+            id: group,
+            name,
+            color: self.groups.len() + 2,
+            collapsed: false,
+            inputs: input,
+        });
+        if let Some(ui) = self.ui.get_mut(&id) {
+            ui.group = Some(group);
+        }
+        self.prune_groups();
     }
 
     /// Rows of an operation node, read from its spec. An input sharing its
@@ -492,143 +1158,1184 @@ impl Graph {
                 .is_some_and(|ui| ui.open.contains(&section.title))
     }
 
-    /// Row centre of `field`, relative to the node's top. Rows of a collapsed
-    /// section keep their ports on its header.
-    fn port_offset(
+    /// The row of `port` among `sections`.
+    fn port_row<'s>(
         &self,
-        id: NodeId,
-        sections: &[NodeSection],
-        field: &str,
-        input: bool,
-    ) -> Option<f32> {
-        let mut y = HEADER_H;
-        for section in sections {
-            let matches =
-                |row: &NodeRow| row.field == field && if input { row.input } else { row.output };
-            let header = if section.title.is_empty() {
-                0.0
-            } else {
-                SECTION_H
-            };
-            if !self.is_open(id, section) {
-                if section.rows.iter().any(matches) {
-                    return Some(y + SECTION_H * 0.5);
-                }
-                y += header;
-                continue;
-            }
-            y += header;
-            for row in &section.rows {
-                if matches(row) {
-                    return Some(y + ROW_H * 0.5);
-                }
-                y += ROW_H;
-            }
-        }
-        None
-    }
-
-    fn port_point(&self, sections: &[Vec<NodeSection>], port: &Port, input: bool) -> Option<Point> {
+        sections: &'s [Vec<NodeSection>],
+        port: &Port,
+        output: bool,
+    ) -> Option<&'s NodeRow> {
         let index = self
             .engine
             .nodes
             .iter()
             .position(|node| node.id == port.node)?;
-        let ui = self.ui.get(&port.node)?;
-        let y = self.port_offset(port.node, &sections[index], &port.field, input)?;
-        let x = if input {
-            PORT_W * 0.5
-        } else {
-            NODE_W - PORT_W * 0.5
-        };
-        Some(self.to_screen(ui.pos + Vector::new(x, y)))
+        sections
+            .get(index)?
+            .iter()
+            .flat_map(|section| &section.rows)
+            .find(|row| row.field == port.field && if output { row.output } else { row.input })
     }
 
-    /// The input port under the cursor.
-    pub fn hit_input(&self, sections: &[Vec<NodeSection>]) -> Option<Port> {
-        self.engine
-            .nodes
-            .iter()
-            .zip(sections)
-            .find_map(|(node, node_sections)| {
-                node_sections
-                    .iter()
-                    .filter(|section| self.is_open(node.id, section))
-                    .flat_map(|section| &section.rows)
-                    .filter(|row| row.input)
-                    .map(|row| Port {
-                        node: node.id,
-                        field: row.field.clone(),
-                    })
-                    .find(|port| {
-                        self.port_point(sections, port, true).is_some_and(|p| {
-                            p.distance(self.cursor) <= PORT_HIT * self.zoom().max(0.5)
-                        })
-                    })
-            })
+    /// The row label of `port` among `sections`, falling back to its field.
+    fn port_label(&self, sections: &[Vec<NodeSection>], port: &Port, output: bool) -> String {
+        self.port_row(sections, port, output).map_or_else(
+            || port.field.clone(),
+            |row| t!(row.label.as_str()).into_owned(),
+        )
+    }
+
+    /// `Node › Row` for an output, as the picker and step rows name it.
+    fn source_name(&self, sections: &[Vec<NodeSection>], port: &Port) -> String {
+        format!(
+            "{} › {}",
+            self.name(port.node),
+            self.port_label(sections, port, true)
+        )
+    }
+
+    /// What `target` accepts: an operation's spec says so; an object row by
+    /// the kind of value it holds now.
+    fn expect(&self, target: &Port, value: &Value) -> Expect {
+        match self.engine.node(target.node).map(|node| &node.kind) {
+            Some(Kind::Op(spec)) => {
+                let Some(input) = spec.inputs.iter().find(|input| input.name == target.field)
+                else {
+                    return Expect::Any;
+                };
+                if input.list {
+                    return Expect::Any;
+                }
+                match input.default {
+                    graph::ops::Initial::Num(_) => Expect::Number,
+                    graph::ops::Initial::Text(_) => Expect::Text,
+                    graph::ops::Initial::Bool(_) => Expect::Bool,
+                    graph::ops::Initial::None => match input.name {
+                        "curve" => Expect::Object,
+                        "point" | "center" => Expect::Point,
+                        _ => Expect::Any,
+                    },
+                }
+            }
+            Some(Kind::Object(_)) => Expect::of_value(value),
+            None => Expect::Any,
+        }
     }
 
     pub fn view(&self, sections: Vec<Vec<NodeSection>>) -> Element<'_, Message> {
-        let wires = self
+        let overlay = if self.steps_hidden {
+            None
+        } else if let Some(confirm) = &self.confirm {
+            Some(self.confirm_dialog(confirm, &sections))
+        } else {
+            self.picking
+                .as_ref()
+                .map(|target| self.picker(target, &sections))
+        };
+        let sources: HashMap<Port, (NodeId, String)> = self
             .engine
             .links
             .iter()
-            .filter_map(|link| {
-                Some((
-                    self.port_point(&sections, &link.from, false)?,
-                    self.port_point(&sections, &link.to, true)?,
-                ))
+            .map(|link| {
+                (
+                    link.to.clone(),
+                    (link.from.node, self.source_name(&sections, &link.from)),
+                )
             })
             .collect();
-        let pending = match &self.drag {
-            Some(Drag::Link(from)) => self
-                .port_point(&sections, from, false)
-                .map(|start| (start, self.cursor)),
-            _ => None,
-        };
-        let zoom = self.zoom();
-        // Lay the nodes out relative to the visible area's top-left rather
-        // than the graph origin: a `pin` clips to its own bounds, so nodes
-        // left of / above the origin vanished once panned or zoomed out (#1592).
-        let shift = Vector::new(self.pan.x / zoom, self.pan.y / zoom);
-        let mut nodes = stack![];
+
+        let mut inputs: Vec<(&graph::Node, Vec<NodeSection>)> = Vec::new();
+        let mut steps: Vec<(&graph::Node, Vec<NodeSection>)> = Vec::new();
         for (node, node_sections) in self.engine.nodes.iter().zip(sections) {
-            let Some(ui) = self.ui.get(&node.id) else {
-                continue;
-            };
-            nodes = nodes.push(
-                pin(self.node_view(node, node_sections))
-                    .x(ui.pos.x + shift.x)
-                    .y(ui.pos.y + shift.y),
-            );
+            if is_input(&node.kind) {
+                inputs.push((node, node_sections));
+            } else {
+                steps.push((node, node_sections));
+            }
         }
-        let mut layers = stack![
-            canvas(Wires {
-                wires,
-                pending,
-                width: 2.0 * zoom.max(0.5)
+        let step_count = steps.len();
+
+        let inputs_body: Element<'_, Message> = if inputs.is_empty() {
+            text(t!(
+                "Add Number, Slider, Text or Boolean nodes from the Input category. Their values are the only ones typed by hand."
+            ))
+            .size(11)
+            .style(weak_text)
+            .into()
+        } else {
+            let mut list = column![].spacing(8);
+            for (group, members) in self.runs(inputs) {
+                let cards: Vec<Element<'_, Message>> = members
+                    .into_iter()
+                    .map(|(node, node_sections)| self.input_card(node, node_sections))
+                    .collect();
+                list = list.push(match group {
+                    Some(group) => {
+                        let count = cards.len();
+                        let body = column(cards).spacing(8).into();
+                        self.group_frame(group, count, body)
+                    }
+                    None => column(cards).spacing(8).into(),
+                });
+            }
+            list.into()
+        };
+        let (eye, eye_label) = if self.steps_hidden {
+            (crate::ui::icons::EYE, "Show nodes")
+        } else {
+            (crate::ui::icons::EYE_OFF, "Hide nodes")
+        };
+        let toggle = button(
+            row![
+                crate::ui::icons::themed(eye, 12.0),
+                text(t!(eye_label)).size(11)
+            ]
+            .spacing(4)
+            .align_y(iced::Center),
+        )
+        .on_press(msg(GraphMsg::ToggleSteps))
+        .style(button::secondary)
+        .padding([3, 8]);
+        let inputs_area = container(
+            column![
+                row![text(t!("Inputs")).size(13).width(Length::Fill), toggle].align_y(iced::Center),
+                scrollable(container(inputs_body).padding(iced::Padding {
+                    top: 0.0,
+                    right: 10.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }))
+                .height(Length::Fill),
+            ]
+            .spacing(8),
+        )
+        .padding(12)
+        .width(INPUTS_W)
+        .height(Length::Fill)
+        .style(|theme: &Theme| {
+            let palette = theme.palette();
+            container::Style {
+                background: Some(Background::Color(
+                    palette.background.weak.color.scale_alpha(0.92),
+                )),
+                border: Border {
+                    color: palette.background.strong.color,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+
+        // Hidden steps leave the drawing uncovered and clickable beside the
+        // Inputs area.
+        if self.steps_hidden {
+            return container(opaque(inputs_area))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+        }
+
+        let arrow = || {
+            container(crate::ui::icons::themed(
+                crate::ui::icons::ARROW_LONG_RIGHT,
+                18.0,
+            ))
+            .padding([12, 6])
+        };
+        let sequence_body: Element<'_, Message> = if steps.is_empty() {
+            container(
+                text(t!(
+                    "Add objects or operations from the Node Graph panel, or select drawn objects and press From drawing. Steps run from left to right, and each one takes its values from an earlier step or from the inputs."
+                ))
+                .size(11)
+                .style(weak_text),
+            )
+            .width(360)
+            .into()
+        } else {
+            let mut track = row![].spacing(0).align_y(iced::Top);
+            let mut step = 0;
+            for (index, (group, members)) in self.runs(steps).into_iter().enumerate() {
+                if index > 0 {
+                    track = track.push(arrow());
+                }
+                let mut lane = row![].spacing(0).align_y(iced::Top);
+                let count = members.len();
+                for (k, (node, node_sections)) in members.into_iter().enumerate() {
+                    if k > 0 {
+                        lane = lane.push(arrow());
+                    }
+                    step += 1;
+                    lane =
+                        lane.push(self.step_card(step, step_count, node, node_sections, &sources));
+                }
+                track = track.push(match group {
+                    Some(group) => self.group_frame(group, count, lane.into()),
+                    None => lane.into(),
+                });
+            }
+            Scaled {
+                content: track.into(),
+                zoom: self.zoom(),
+            }
+            .into()
+        };
+        let zoom_button = |icon: &'static [u8], tip: &str, steps: i32, enabled: bool| {
+            icon_button(icon, tip, enabled.then_some(GraphMsg::Zoom(steps)))
+        };
+        let toolbar = row![
+            tooltip(
+                button(
+                    row![
+                        crate::ui::icons::themed(crate::ui::icons::EYEDROPPER, 11.0),
+                        text(t!("From drawing")).size(11)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                )
+                .on_press(msg(GraphMsg::FromSelection))
+                .style(button::secondary)
+                .padding([3, 8]),
+                container(text(t!("Add a node for each selected object in the drawing")).size(10))
+                    .padding([2, 6])
+                    .style(container::bordered_box),
+                tooltip::Position::Bottom,
+            )
+            .gap(4),
+            Space::new().width(10),
+            icon_button(
+                crate::ui::icons::UNDO,
+                "Undo graph change",
+                self.can_undo().then_some(GraphMsg::Undo)
+            ),
+            icon_button(
+                crate::ui::icons::REDO,
+                "Redo graph change",
+                self.can_redo().then_some(GraphMsg::Redo)
+            ),
+            Space::new().width(10),
+            zoom_button(
+                crate::ui::icons::MINUS,
+                "Zoom out (Ctrl + wheel)",
+                -1,
+                self.zoom_steps > *ZOOM_STEPS.start()
+            ),
+            button(text(format!("{:.0}%", self.zoom() * 100.0)).size(11))
+                .on_press(msg(GraphMsg::Zoom(0)))
+                .style(button::text)
+                .padding([3, 6]),
+            zoom_button(
+                crate::ui::icons::PLUS,
+                "Zoom in (Ctrl + wheel)",
+                1,
+                self.zoom_steps < *ZOOM_STEPS.end()
+            ),
+        ]
+        .spacing(2)
+        .align_y(iced::Center);
+        let sequence = column![
+            row![
+                text(t!("Node Sequence")).size(13).width(Length::Fill),
+                toolbar
+            ]
+            .align_y(iced::Center),
+            scrollable(container(sequence_body).padding(iced::Padding {
+                top: 0.0,
+                right: 12.0,
+                bottom: 4.0,
+                left: 0.0,
+            }))
+            .direction(scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
             })
             .width(Length::Fill)
-            .height(Length::Fill),
-            Zoomed {
-                content: nodes.width(Length::Fill).height(Length::Fill).into(),
-                zoom,
-            },
-        ];
-        if let Some(Drag::Palette(item)) = self.drag {
-            let ghost = container(text(t!(item.label())).size(11))
-                .padding([3, 8])
-                .style(container::bordered_box);
-            layers = layers.push(pin(ghost).x(self.cursor.x + 10.0).y(self.cursor.y + 10.0));
+            // As tall as the nodes, up to the space there is, so the
+            // horizontal scrollbar sits right under them.
+            .height(Length::Shrink),
+        ]
+        .spacing(8)
+        .padding(12);
+
+        let backdrop = container(row![inputs_area, sequence])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|theme: &Theme| container::Style {
+                background: Some(Background::Color(
+                    theme.palette().background.base.color.scale_alpha(0.6),
+                )),
+                ..Default::default()
+            });
+        let mut layers = stack![backdrop];
+        if let Some(overlay) = overlay {
+            layers = layers.push(overlay);
         }
-        let area = mouse_area(layers.width(Length::Fill).height(Length::Fill))
-            .on_move(|p| msg(GraphMsg::Moved(p)))
-            .on_press(msg(GraphMsg::Pressed))
-            .on_release(msg(GraphMsg::Released))
-            .on_middle_press(msg(GraphMsg::Pressed))
-            .on_middle_release(msg(GraphMsg::Released))
-            .on_scroll(|delta| msg(GraphMsg::Zoom(delta)));
-        opaque(area)
+        opaque(layers.width(Length::Fill).height(Length::Fill))
+    }
+
+    /// Splits nodes into runs of consecutive members of one group (or of
+    /// none).
+    fn runs<'n>(
+        &self,
+        nodes: Vec<(&'n graph::Node, Vec<NodeSection>)>,
+    ) -> Vec<(Option<&NodeGroup>, Vec<(&'n graph::Node, Vec<NodeSection>)>)> {
+        let mut runs: Vec<(Option<GroupId>, Vec<(&'n graph::Node, Vec<NodeSection>)>)> = Vec::new();
+        for (node, node_sections) in nodes {
+            let group = self.node_group(node.id);
+            match runs.last_mut() {
+                Some((last, members)) if *last == group => members.push((node, node_sections)),
+                _ => runs.push((group, vec![(node, node_sections)])),
+            }
+        }
+        runs.into_iter()
+            .map(|(group, members)| (group.and_then(|group| self.group(group)), members))
+            .collect()
+    }
+
+    /// A group's frame: a tinted panel with its colour chip, name (click to
+    /// rename), size, collapse, colour and ungroup controls over `body`.
+    fn group_frame<'a>(
+        &'a self,
+        group: &NodeGroup,
+        count: usize,
+        body: Element<'a, Message>,
+    ) -> Element<'a, Message> {
+        let color = group_color(group);
+        let id = group.id;
+        let name: Element<'_, Message> = match &self.renaming {
+            Some((Renaming::Group(renaming), draft)) if *renaming == id => text_input("", draft)
+                .id(iced::widget::Id::new(RENAME_ID))
+                .on_input(|value| msg(GraphMsg::RenameInput(value)))
+                .on_submit(msg(GraphMsg::RenameCommit))
+                .size(12)
+                .padding([2, 4])
+                .width(180)
+                .into(),
+            _ => tooltip(
+                button(
+                    text(group.name.clone())
+                        .size(12)
+                        .style(move |_: &Theme| text::Style { color: Some(color) }),
+                )
+                .on_press(msg(GraphMsg::GroupRenameStart(id)))
+                .style(button::text)
+                .padding(0),
+                container(text(t!("Click to rename").into_owned()).size(10))
+                    .padding([2, 6])
+                    .style(container::bordered_box),
+                tooltip::Position::Top,
+            )
+            .gap(4)
+            .into(),
+        };
+        let size = if group.inputs {
+            crate::tf!("{} inputs", count)
+        } else {
+            crate::tf!("{} steps", count)
+        };
+        let swatch = tooltip(
+            button(badge(color, None))
+                .on_press(msg(GraphMsg::GroupColor(id)))
+                .style(button::text)
+                .padding(2),
+            container(text(t!("Change colour").into_owned()).size(10))
+                .padding([2, 6])
+                .style(container::bordered_box),
+            tooltip::Position::Top,
+        )
+        .gap(4);
+        let header = row![
+            button(crate::ui::icons::themed_arrow_toggle(!group.collapsed, 9.0))
+                .on_press(msg(GraphMsg::GroupCollapse(id)))
+                .style(button::text)
+                .padding([4, 4]),
+            swatch,
+            name,
+            text(size.into_owned()).size(10).style(weak_text),
+            Space::new().width(Length::Fill),
+            icon_button(
+                crate::ui::icons::CLOSE,
+                "Ungroup",
+                Some(GraphMsg::GroupDelete(id))
+            ),
+        ]
+        .spacing(6)
+        .align_y(iced::Center);
+        let mut frame = column![header].spacing(6);
+        if !group.collapsed {
+            frame = frame.push(body);
+        }
+        let mut frame = container(frame)
+            .padding(8)
+            .style(move |_: &Theme| container::Style {
+                background: Some(Background::Color(color.scale_alpha(0.10))),
+                border: Border {
+                    color: color.scale_alpha(0.7),
+                    width: 1.5,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+        if group.inputs {
+            frame = frame.width(Length::Fill);
+        } else if group.collapsed {
+            frame = frame.width(220);
+        }
+        frame.into()
+    }
+
+    /// A node's header: its colour chip (with the step number on the
+    /// node sequence), its name (click to rename) over its type, then `extra`
+    /// buttons, duplicate and delete.
+    fn header(
+        &self,
+        node: &graph::Node,
+        step: Option<usize>,
+        extra: Vec<Element<'static, Message>>,
+    ) -> Element<'_, Message> {
+        let id = node.id;
+        let count = self.ui.get(&id).map_or(0, |ui| ui.handles.len());
+        let mut kind = kind_name(&node.kind);
+        if count > 1 {
+            kind = format!("{kind} ×{count}");
+        }
+        let name: Element<'_, Message> = match &self.renaming {
+            Some((Renaming::Node(renaming), draft)) if *renaming == id => text_input("", draft)
+                .id(iced::widget::Id::new(RENAME_ID))
+                .on_input(|value| msg(GraphMsg::RenameInput(value)))
+                .on_submit(msg(GraphMsg::RenameCommit))
+                .size(12)
+                .padding([2, 4])
+                .into(),
+            _ => tooltip(
+                button(text(self.name(id)).size(12))
+                    .on_press(msg(GraphMsg::RenameStart(id)))
+                    .style(|theme: &Theme, status| {
+                        let mut style = button::text(theme, status);
+                        style.text_color = theme.palette().primary.weak.text;
+                        style
+                    })
+                    .padding(0),
+                container(text(t!("Click to rename").into_owned()).size(10))
+                    .padding([2, 6])
+                    .style(container::bordered_box),
+                tooltip::Position::Top,
+            )
+            .gap(4)
+            .into(),
+        };
+        let title = column![
+            name,
+            text(kind).size(10).style(|theme: &Theme| text::Style {
+                color: Some(theme.palette().primary.weak.text.scale_alpha(0.7)),
+            }),
+        ]
+        .spacing(1)
+        .width(Length::Fill);
+        let mut header = row![
+            badge(node_color(id), step.map(|step| step.to_string())),
+            title
+        ]
+        .spacing(4)
+        .align_y(iced::Center);
+        for element in extra {
+            header = header.push(element);
+        }
+        header = header.push(icon_button(
+            crate::ui::icons::COPY,
+            "Duplicate node",
+            Some(GraphMsg::Duplicate(id)),
+        ));
+        header = header.push(icon_button(
+            crate::ui::icons::CLOSE,
+            "Delete node",
+            Some(GraphMsg::NodeDelete(id)),
+        ));
+        container(header)
+            .padding([5, 6])
+            .width(Length::Fill)
+            .style(header_style)
+            .into()
+    }
+
+    /// The group list at the foot of a card.
+    fn group_picker(&self, id: NodeId) -> Element<'_, Message> {
+        let input = self
+            .engine
+            .node(id)
+            .is_some_and(|node| is_input(&node.kind));
+        let mut options = vec![GroupChoice::None];
+        options.extend(
+            self.groups
+                .iter()
+                .filter(|group| group.inputs == input)
+                .map(|group| GroupChoice::Join(group.id, group.name.clone())),
+        );
+        options.push(GroupChoice::New);
+        let selected = match self.node_group(id).and_then(|group| self.group(group)) {
+            Some(group) => GroupChoice::Join(group.id, group.name.clone()),
+            None => GroupChoice::None,
+        };
+        pick_list(Some(selected), options, GroupChoice::to_string)
+            .on_select(move |choice| {
+                msg(match choice {
+                    GroupChoice::None => GraphMsg::GroupAssign(id, None),
+                    GroupChoice::Join(group, _) => GraphMsg::GroupAssign(id, Some(group)),
+                    GroupChoice::New => GraphMsg::GroupNew(id),
+                })
+            })
+            .text_size(10)
+            .padding([1, 6])
+            .into()
+    }
+
+    /// A card's frame, edged in its node's colour.
+    fn card<'a>(
+        id: NodeId,
+        content: impl Into<Element<'a, Message>>,
+    ) -> container::Container<'a, Message> {
+        let color = node_color(id);
+        container(content).style(move |theme: &Theme| {
+            let mut style = card_style(theme);
+            style.border.color = color.scale_alpha(0.8);
+            style.border.width = 1.5;
+            style
+        })
+    }
+
+    /// An Inputs-area card: the node's values, all typed by hand.
+    fn input_card(&self, node: &graph::Node, sections: Vec<NodeSection>) -> Element<'_, Message> {
+        let id = node.id;
+        let uses = self.dependents(id).len();
+        let extra = vec![
+            icon_button(
+                crate::ui::icons::TRI_UP,
+                "Move up",
+                self.can_move(id, -1).then_some(GraphMsg::Move(id, -1)),
+            ),
+            icon_button(
+                crate::ui::icons::TRI_DOWN,
+                "Move down",
+                self.can_move(id, 1).then_some(GraphMsg::Move(id, 1)),
+            ),
+        ];
+        let mut body = column![].spacing(4).padding([6, 8]);
+        for node_row in sections.into_iter().flat_map(|section| section.rows) {
+            if node_row.input {
+                body = body.push(self.input_row(id, node_row));
+            }
+        }
+        body = body.push(
+            row![
+                text(if uses == 0 {
+                    t!("Not used yet").into_owned()
+                } else {
+                    crate::tf!("Used by {} inputs", uses).into_owned()
+                })
+                .size(10)
+                .style(weak_text)
+                .width(Length::Fill),
+                self.group_picker(id),
+            ]
+            .spacing(4)
+            .align_y(iced::Center),
+        );
+        Self::card(id, column![self.header(node, None, extra), body])
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// One hand-typed value of an input node.
+    fn input_row(&self, id: NodeId, node_row: NodeRow) -> Element<'_, Message> {
+        let port = Port {
+            node: id,
+            field: node_row.field,
+        };
+        let shown = display(&node_row.value);
+        let value: Element<'_, Message> = match node_row.widget {
+            RowWidget::Slider { min, max, step } => {
+                let current = graph::value::num(&node_row.value).unwrap_or(min);
+                let set = port.clone();
+                let mut bar = slider(min.min(max)..=max.max(min), current, move |x| {
+                    msg(GraphMsg::Set(set.clone(), graph::value::number(x)))
+                });
+                if step > 0.0 {
+                    bar = bar.step(step);
+                }
+                row![bar.width(Length::Fill), text(shown).size(11)]
+                    .spacing(6)
+                    .align_y(iced::Center)
+                    .width(Length::Fill)
+                    .into()
+            }
+            RowWidget::Toggle => {
+                let set = port.clone();
+                checkbox(graph::value::boolean(&node_row.value).unwrap_or(false))
+                    .on_toggle(move |on| msg(GraphMsg::Set(set.clone(), Value::Bool(on))))
+                    .size(14)
+                    .width(Length::Fill)
+                    .into()
+            }
+            RowWidget::Field => {
+                let draft = self.drafts.get(&port).cloned().unwrap_or(shown);
+                let edit = port.clone();
+                text_input("", &draft)
+                    .on_input(move |s| msg(GraphMsg::Input(edit.clone(), s)))
+                    .on_submit(msg(GraphMsg::Commit(port)))
+                    .size(11)
+                    .padding([3, 5])
+                    .width(Length::Fill)
+                    .into()
+            }
+        };
+        row![
+            text(t!(node_row.label.as_str()).into_owned())
+                .size(11)
+                .width(64),
+            value
+        ]
+        .spacing(4)
+        .align_y(iced::Center)
+        .into()
+    }
+
+    /// A step of the node sequence: its settable rows, every one a picker button.
+    /// Computed rows (lengths, angles, deltas, results…) are left out; the
+    /// picker still offers them.
+    fn step_card(
+        &self,
+        step: usize,
+        steps: usize,
+        node: &graph::Node,
+        sections: Vec<NodeSection>,
+        sources: &HashMap<Port, (NodeId, String)>,
+    ) -> Element<'_, Message> {
+        let id = node.id;
+        let index = step - 1;
+        let extra = vec![
+            icon_button(
+                crate::ui::icons::TRI_LEFT,
+                "Move earlier",
+                (index > 0).then_some(GraphMsg::Move(id, -1)),
+            ),
+            icon_button(
+                crate::ui::icons::TRI_RIGHT,
+                "Move later",
+                (index + 1 < steps).then_some(GraphMsg::Move(id, 1)),
+            ),
+        ];
+        let mut body = column![].spacing(2).padding([4, 6]);
+        if sections.is_empty() {
+            body = body.push(
+                container(text(t!("Object deleted")).size(11).style(weak_text)).padding([2, 2]),
+            );
+        }
+        let mut computed: Vec<NodeRow> = Vec::new();
+        for section in sections {
+            let open = self.is_open(id, &section);
+            let (rows, rest): (Vec<NodeRow>, Vec<NodeRow>) =
+                section.rows.into_iter().partition(|row| row.input);
+            // The object handle is the node itself; the picker offers it.
+            computed.extend(rest.into_iter().filter(|row| row.field != "object"));
+            if rows.is_empty() {
+                continue;
+            }
+            if !section.title.is_empty() {
+                body = body.push(
+                    button(
+                        row![
+                            crate::ui::icons::themed_arrow_toggle(open, 9.0),
+                            text(section.title.clone()).size(11)
+                        ]
+                        .spacing(4)
+                        .align_y(iced::Center),
+                    )
+                    .on_press(msg(GraphMsg::Section(id, section.title)))
+                    .style(button::secondary)
+                    .width(Length::Fill)
+                    .padding([3, 6]),
+                );
+            }
+            if open {
+                for node_row in rows {
+                    body = body.push(self.step_row(id, node_row, sources));
+                }
+            }
+        }
+        // Computed rows (lengths, angles, deltas, results…) are read-only:
+        // a collapsed group of their own, closed until opened.
+        if !computed.is_empty() {
+            let open = self
+                .ui
+                .get(&id)
+                .is_some_and(|ui| ui.open.contains(COMPUTED_SECTION));
+            body = body.push(
+                button(
+                    row![
+                        crate::ui::icons::themed_arrow_toggle(open, 9.0),
+                        text(t!("Computed values")).size(11).width(Length::Fill),
+                        text(computed.len().to_string()).size(10).style(weak_text),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                )
+                .on_press(msg(GraphMsg::Section(id, COMPUTED_SECTION.to_owned())))
+                .style(button::secondary)
+                .width(Length::Fill)
+                .padding([3, 6]),
+            );
+            if open {
+                for node_row in computed {
+                    body = body.push(
+                        row![
+                            text(t!(node_row.label.as_str()).into_owned())
+                                .size(11)
+                                .width(LABEL_W),
+                            text(display(&node_row.value))
+                                .size(11)
+                                .style(weak_text)
+                                .width(Length::Fill),
+                        ]
+                        .spacing(4)
+                        .padding([3, 4])
+                        .align_y(iced::Center),
+                    );
+                }
+            }
+        }
+        body = body.push(
+            row![Space::new().width(Length::Fill), self.group_picker(id)]
+                .spacing(4)
+                .padding([4, 2])
+                .align_y(iced::Center),
+        );
+        Self::card(id, column![self.header(node, Some(step), extra), body])
+            .width(NODE_W)
+            .into()
+    }
+
+    fn step_row(
+        &self,
+        id: NodeId,
+        node_row: NodeRow,
+        sources: &HashMap<Port, (NodeId, String)>,
+    ) -> Element<'_, Message> {
+        let port = Port {
+            node: id,
+            field: node_row.field,
+        };
+        let shown = display(&node_row.value);
+        let label = text(t!(node_row.label.as_str()).into_owned())
+            .size(11)
+            .width(LABEL_W);
+        let source = sources.get(&port).cloned();
+        let picking = self.picking.as_ref() == Some(&port);
+        let linked = source.is_some();
+        let content: Element<'_, Message> = match source {
+            Some((from, source)) => row![
+                badge(node_color(from), None),
+                column![
+                    text(source).size(11),
+                    text(format!("= {shown}")).size(10).style(weak_text),
+                ]
+                .spacing(1)
+            ]
+            .spacing(6)
+            .align_y(iced::Center)
+            .into(),
+            None => row![
+                text(if shown.is_empty() {
+                    "—".to_owned()
+                } else {
+                    shown
+                })
+                .size(11)
+                .style(weak_text)
+                .width(Length::Fill),
+                crate::ui::icons::themed(crate::ui::icons::EYEDROPPER, 10.0),
+            ]
+            .align_y(iced::Center)
+            .into(),
+        };
+        let selector = button(content)
+            .on_press(msg(GraphMsg::Pick(port.clone())))
+            .width(Length::Fill)
+            .padding([3, 6])
+            .style(move |theme: &Theme, status| {
+                let palette = theme.palette();
+                let accent = picking || linked;
+                let mut style = button::Style {
+                    background: Some(Background::Color(if picking {
+                        palette.primary.weak.color
+                    } else {
+                        palette.background.weak.color
+                    })),
+                    text_color: palette.background.base.text,
+                    border: Border {
+                        color: if accent {
+                            palette.primary.base.color
+                        } else {
+                            palette.background.strong.color
+                        },
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                };
+                if matches!(status, button::Status::Hovered) {
+                    style.border.color = palette.primary.base.color;
+                }
+                style
+            });
+        let mut line = row![label, selector].spacing(4).align_y(iced::Center);
+        if linked {
+            line = line.push(icon_button(
+                crate::ui::icons::CLOSE,
+                "Clear value",
+                Some(GraphMsg::Unlink(port)),
+            ));
+        }
+        container(line).padding([2, 2]).into()
+    }
+
+    /// Values `target` may take: every input, then every output of the
+    /// steps before it — computed ones included — one coloured group per
+    /// node. Values of the wrong kind are dimmed.
+    fn picker(&self, target: &Port, sections: &[Vec<NodeSection>]) -> Element<'_, Message> {
+        let steps = self.steps();
+        let before = steps.get(&target.node).copied().unwrap_or(0);
+        let current = self
+            .engine
+            .links
+            .iter()
+            .find(|link| &link.to == target)
+            .map(|link| link.from.clone());
+        let target_value = self
+            .port_row(sections, target, false)
+            .map(|row| row.value.clone())
+            .unwrap_or(Value::Null);
+        let expect = self.expect(target, &target_value);
+        let query = self.pick_search.trim().to_lowercase();
+
+        struct Entry {
+            port: Port,
+            label: String,
+            value: String,
+            computed: bool,
+            fits: bool,
+        }
+        struct Group {
+            id: NodeId,
+            name: String,
+            step: Option<usize>,
+            kind: String,
+            tag: String,
+            entries: Vec<Entry>,
+        }
+        let mut groups: Vec<Group> = Vec::new();
+        let candidates = self
+            .engine
+            .nodes
+            .iter()
+            .zip(sections)
+            .filter(|(node, _)| is_input(&node.kind))
+            .chain(
+                self.engine
+                    .nodes
+                    .iter()
+                    .zip(sections)
+                    .filter(|(node, _)| steps.get(&node.id).is_some_and(|step| *step < before)),
+            );
+        for (node, node_sections) in candidates {
+            let name = self.name(node.id);
+            let name_match = name.to_lowercase().contains(&query);
+            let entries: Vec<Entry> = node_sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .filter(|row| row.output)
+                .map(|row| Entry {
+                    port: Port {
+                        node: node.id,
+                        field: row.field.clone(),
+                    },
+                    label: t!(row.label.as_str()).into_owned(),
+                    value: display(&row.value),
+                    computed: !row.input,
+                    fits: expect.fits(&row.value),
+                })
+                .filter(|entry| {
+                    query.is_empty() || name_match || entry.label.to_lowercase().contains(&query)
+                })
+                .collect();
+            if !entries.is_empty() {
+                groups.push(Group {
+                    id: node.id,
+                    name,
+                    step: steps.get(&node.id).map(|step| step + 1),
+                    kind: kind_name(&node.kind),
+                    tag: kind_tag(&node.kind),
+                    entries,
+                });
+            }
+        }
+
+        let mut list = column![].spacing(8);
+        if groups.is_empty() {
+            list = list.push(
+                text(t!(
+                    "No values to choose from. Add inputs, or steps earlier in the node sequence."
+                ))
+                .size(11)
+                .style(weak_text),
+            );
+        }
+        for group in groups {
+            let color = node_color(group.id);
+            let tag =
+                container(text(group.tag).size(10))
+                    .padding([1, 6])
+                    .style(move |_: &Theme| container::Style {
+                        background: Some(Background::Color(color.scale_alpha(0.25))),
+                        border: Border {
+                            color,
+                            width: 1.0,
+                            radius: 8.0.into(),
+                        },
+                        ..Default::default()
+                    });
+            let mut entries = column![row![
+                badge(color, group.step.map(|step| step.to_string())),
+                column![
+                    text(group.name)
+                        .size(12)
+                        .style(move |_: &Theme| text::Style { color: Some(color) }),
+                    text(group.kind).size(10).style(weak_text),
+                ]
+                .spacing(1)
+                .width(Length::Fill),
+                tag,
+            ]
+            .spacing(8)
+            .align_y(iced::Center)
+            .padding([2, 4])]
+            .spacing(1);
+            for entry in group.entries {
+                let chosen = current.as_ref() == Some(&entry.port);
+                let fits = entry.fits;
+                let mut label_row = row![text(entry.label).size(11)]
+                    .spacing(4)
+                    .align_y(iced::Center);
+                if entry.computed {
+                    label_row = label_row.push(text(t!("computed")).size(9).style(weak_text));
+                }
+                if !fits {
+                    label_row = label_row.push(text(t!("other type")).size(9).style(weak_text));
+                }
+                entries = entries.push(
+                    button(
+                        row![
+                            container(label_row).width(Length::FillPortion(2)),
+                            text(entry.value)
+                                .size(11)
+                                .style(weak_text)
+                                .width(Length::FillPortion(3)),
+                        ]
+                        .spacing(6)
+                        .align_y(iced::Center),
+                    )
+                    .on_press(msg(GraphMsg::Choose(entry.port)))
+                    .width(Length::Fill)
+                    .padding([3, 10])
+                    .style(move |theme: &Theme, status| {
+                        if chosen {
+                            return button::primary(theme, status);
+                        }
+                        let mut style = button::text(theme, status);
+                        if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+                            style.background = Some(Background::Color(color.scale_alpha(0.25)));
+                        }
+                        if !fits {
+                            style.text_color = style.text_color.scale_alpha(0.45);
+                        }
+                        style.border.radius = 4.0.into();
+                        style
+                    }),
+                );
+            }
+            list = list.push(container(entries).padding(4).width(Length::Fill).style(
+                move |_: &Theme| container::Style {
+                    background: Some(Background::Color(color.scale_alpha(0.08))),
+                    border: Border {
+                        color: color.scale_alpha(0.6),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
+
+        let mut title = column![
+            text(t!("Select value")).size(13),
+            text(format!(
+                "{} › {}",
+                self.name(target.node),
+                self.port_label(sections, target, false)
+            ))
+            .size(11)
+            .style(weak_text),
+        ]
+        .spacing(2)
+        .width(Length::Fill);
+        if let Some(label) = expect.label() {
+            title = title.push(text(t!(label)).size(10).style(weak_text));
+        }
+        let mut actions = row![].spacing(6).align_y(iced::Center);
+        if let Some(kind) = expect.input_kind() {
+            let value = match kind {
+                "Number" => graph::value::num(&target_value)
+                    .map_or(graph::value::number(0.0), graph::value::number),
+                "Text" => Value::String(graph::value::text(&target_value)),
+                _ => Value::Bool(graph::value::boolean(&target_value).unwrap_or(false)),
+            };
+            actions = actions.push(
+                button(
+                    row![
+                        crate::ui::icons::themed(crate::ui::icons::PLUS, 10.0),
+                        text(t!("New input with this value")).size(11)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                )
+                .on_press(msg(GraphMsg::PickNewInput(kind, value)))
+                .style(button::primary)
+                .padding([4, 10]),
+            );
+        }
+        actions = actions.push(Space::new().width(Length::Fill));
+        if current.is_some() {
+            actions = actions.push(
+                button(text(t!("Clear value")).size(11))
+                    .on_press(msg(GraphMsg::Unlink(target.clone())))
+                    .style(button::secondary)
+                    .padding([4, 10]),
+            );
+        }
+        actions = actions.push(
+            button(text(t!("Cancel")).size(11))
+                .on_press(msg(GraphMsg::PickCancel))
+                .style(button::secondary)
+                .padding([4, 10]),
+        );
+        let card = container(
+            column![
+                row![
+                    badge(node_color(target.node), None),
+                    title,
+                    icon_button(
+                        crate::ui::icons::CLOSE,
+                        "Cancel",
+                        Some(GraphMsg::PickCancel)
+                    )
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                text_input(&t!("Search values…"), &self.pick_search)
+                    .id(iced::widget::Id::new(PICK_SEARCH_ID))
+                    .on_input(|value| msg(GraphMsg::PickSearch(value)))
+                    .padding([4, 8])
+                    .size(12),
+                scrollable(container(list).padding(iced::Padding {
+                    top: 0.0,
+                    right: 10.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }))
+                .height(Length::Fixed(380.0)),
+                actions,
+            ]
+            .spacing(8),
+        )
+        .padding(12)
+        .width(PICKER_W)
+        .style(card_style);
+        modal(card.into(), GraphMsg::PickCancel)
+    }
+
+    /// Asks before an edit drops links, naming each one.
+    fn confirm_dialog(
+        &self,
+        confirm: &Confirm,
+        sections: &[Vec<NodeSection>],
+    ) -> Element<'_, Message> {
+        let name = self.name(confirm.node);
+        let (title, lead, action) = if confirm.delete {
+            (
+                t!("Delete node?").into_owned(),
+                crate::tf!("Other nodes read from {}. Deleting it clears:", name).into_owned(),
+                t!("Delete").into_owned(),
+            )
+        } else {
+            (
+                t!("Move node?").into_owned(),
+                crate::tf!("Values only flow forward. Moving {} there clears:", name).into_owned(),
+                t!("Move").into_owned(),
+            )
+        };
+        let mut links = column![].spacing(3);
+        for link in &confirm.links {
+            links = links.push(
+                row![
+                    badge(node_color(link.to.node), None),
+                    text(format!(
+                        "{} › {}",
+                        self.name(link.to.node),
+                        self.port_label(sections, &link.to, false)
+                    ))
+                    .size(11),
+                    text(format!("← {}", self.source_name(sections, &link.from)))
+                        .size(11)
+                        .style(weak_text),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            );
+        }
+        let card = container(
+            column![
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::WARNING, 16.0),
+                    text(title).size(13)
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                text(lead).size(11),
+                scrollable(links).height(Length::Shrink),
+                text(t!(
+                    "Those inputs fall back to their own values. Undo restores them."
+                ))
+                .size(10)
+                .style(weak_text),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text(t!("Cancel")).size(11))
+                        .on_press(msg(GraphMsg::ConfirmNo))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    button(text(action).size(11))
+                        .on_press(msg(GraphMsg::ConfirmYes))
+                        .style(button::danger)
+                        .padding([4, 10]),
+                ]
+                .spacing(6),
+            ]
+            .spacing(10),
+        )
+        .padding(14)
+        .width(PICKER_W)
+        .style(card_style);
+        modal(card.into(), GraphMsg::ConfirmNo)
     }
 
     fn palette_entry(&self, item: PaletteItem) -> Element<'_, Message> {
@@ -640,24 +2347,21 @@ impl Graph {
                 ),
             PaletteItem::Op(_) => Space::new().width(14.0).into(),
         };
-        mouse_area(
-            container(
-                row![icon, text(t!(item.label())).size(12)]
-                    .spacing(6)
-                    .align_y(iced::Center),
-            )
-            .padding([3, 10])
-            .width(Length::Fill),
+        button(
+            row![icon, text(t!(item.label())).size(12)]
+                .spacing(6)
+                .align_y(iced::Center),
         )
-        .on_press(msg(GraphMsg::PalettePress(item)))
-        .on_release(msg(GraphMsg::PaletteRelease))
-        .interaction(mouse::Interaction::Grab)
+        .on_press(msg(GraphMsg::Add(item)))
+        .style(button::text)
+        .padding([3, 10])
+        .width(Length::Fill)
         .into()
     }
 
     /// The node library as a docked panel: title bar, a search box with the
-    /// graph's New / Open / Save beside it, then the categories. Entries are
-    /// clicked or dragged onto the canvas.
+    /// graph's New / Open / Save beside it, then the categories. Clicking an
+    /// entry adds it: inputs to the Inputs area, the rest to the node sequence.
     pub fn panel(&self, width: f32, chrome: crate::ui::dock::Chrome) -> Element<'_, Message> {
         use crate::ui::dock::{self, PanelId};
         let tool = |icon: &'static [u8], tip: &str, message: GraphMsg| {
@@ -675,6 +2379,20 @@ impl Graph {
             tool(crate::ui::icons::DOC_NEW, "New graph", GraphMsg::New),
             tool(crate::ui::icons::FOLDER_OPEN, "Open graph", GraphMsg::Open),
             tool(crate::ui::icons::SAVE, "Save graph", GraphMsg::Save),
+            tool(
+                crate::ui::icons::EYEDROPPER,
+                "Nodes from the selected objects",
+                GraphMsg::FromSelection
+            ),
+            if self.steps_hidden {
+                tool(crate::ui::icons::EYE, "Show nodes", GraphMsg::ToggleSteps)
+            } else {
+                tool(
+                    crate::ui::icons::EYE_OFF,
+                    "Hide nodes",
+                    GraphMsg::ToggleSteps,
+                )
+            },
         ]
         .spacing(4)
         .align_y(iced::Center);
@@ -746,160 +2464,35 @@ impl Graph {
         )
     }
 
-    fn node_view(&self, node: &graph::Node, sections: Vec<NodeSection>) -> Element<'_, Message> {
-        let id = node.id;
-        let title = match &node.kind {
-            Kind::Op(spec) => t!(spec.name).into_owned(),
-            Kind::Object(name) => {
-                let count = self.ui.get(&id).map_or(0, |ui| ui.handles.len());
-                let name = t!(name.as_str()).into_owned();
-                if count > 1 {
-                    format!("{name} ×{count}")
-                } else {
-                    name
-                }
-            }
+    /// Ends a rename: an empty name keeps the old one, a node name that is
+    /// taken gets a number.
+    fn commit_rename(&mut self) {
+        let Some((target, draft)) = self.renaming.take() else {
+            return;
         };
-        let header = row![
-            mouse_area(
-                container(text(title).size(12))
-                    .padding([4, 8])
-                    .width(Length::Fill)
-                    .height(HEADER_H),
-            )
-            .on_press(msg(GraphMsg::NodePress(id)))
-            .interaction(mouse::Interaction::Grab),
-            button(crate::ui::icons::themed(crate::ui::icons::CLOSE, 10.0))
-                .on_press(msg(GraphMsg::NodeDelete(id)))
-                .style(button::text)
-                .padding([6, 8]),
-        ]
-        .height(HEADER_H);
-        let header = container(header).style(|theme: &Theme| container::Style {
-            background: Some(Background::Color(theme.palette().primary.weak.color)),
-            text_color: Some(theme.palette().primary.weak.text),
-            ..Default::default()
-        });
-        let mut col = column![header];
-        if sections.is_empty() {
-            col = col.push(
-                container(text(t!("Object deleted")).size(11))
-                    .padding([4, 8])
-                    .height(ROW_H),
-            );
+        let wanted = draft.trim();
+        if wanted.is_empty() {
+            return;
         }
-        for section in sections {
-            let open = self.is_open(id, &section);
-            if !section.title.is_empty() {
-                col = col.push(
-                    button(
-                        row![
-                            crate::ui::icons::themed_arrow_toggle(open, 9.0),
-                            text(section.title.clone()).size(11)
-                        ]
-                        .spacing(4)
-                        .align_y(iced::Center),
-                    )
-                    .on_press(msg(GraphMsg::Section(id, section.title)))
-                    .style(button::secondary)
-                    .width(Length::Fill)
-                    .height(SECTION_H)
-                    .padding([0, 6]),
-                );
-            }
-            if open {
-                for node_row in section.rows {
-                    col = col.push(self.row_view(id, node_row));
-                }
-            }
-        }
-        opaque(
-            container(col)
-                .width(NODE_W)
-                .style(|theme: &Theme| container::Style {
-                    background: Some(Background::Color(theme.palette().background.base.color)),
-                    border: Border {
-                        color: theme.palette().background.strong.color,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }),
-        )
-    }
-
-    fn row_view(&self, id: NodeId, node_row: NodeRow) -> Element<'_, Message> {
-        let port = Port {
-            node: id,
-            field: node_row.field,
-        };
-        let linked_in = self.engine.is_linked(&port);
-        let linked_out = self.engine.links.iter().any(|link| link.from == port);
-        let shown = display(&node_row.value);
-        let in_port: Element<'_, Message> = if node_row.input {
-            mouse_area(port_dot(linked_in))
-                .on_press(msg(GraphMsg::InPress(port.clone())))
-                .into()
-        } else {
-            Space::new().width(PORT_W).into()
-        };
-        let out_port: Element<'_, Message> = if node_row.output {
-            mouse_area(port_dot(linked_out))
-                .on_press(msg(GraphMsg::OutPress(port.clone())))
-                .into()
-        } else {
-            Space::new().width(PORT_W).into()
-        };
-        let value: Element<'_, Message> = if node_row.input && !linked_in {
-            match node_row.widget {
-                RowWidget::Slider { min, max, step } => {
-                    let current = graph::value::num(&node_row.value).unwrap_or(min);
-                    let set = port.clone();
-                    let mut bar = slider(min.min(max)..=max.max(min), current, move |x| {
-                        msg(GraphMsg::Set(set.clone(), graph::value::number(x)))
-                    });
-                    if step > 0.0 {
-                        bar = bar.step(step);
+        match target {
+            Renaming::Node(id) => {
+                let name = self.unique_name(wanted, Some(id), false);
+                if self.ui.get(&id).is_some_and(|ui| ui.name != name) {
+                    self.record();
+                    if let Some(ui) = self.ui.get_mut(&id) {
+                        ui.name = name;
                     }
-                    row![bar.width(Length::Fill), text(shown).size(11)]
-                        .spacing(4)
-                        .align_y(iced::Center)
-                        .width(Length::Fill)
-                        .into()
-                }
-                RowWidget::Toggle => {
-                    let set = port.clone();
-                    checkbox(graph::value::boolean(&node_row.value).unwrap_or(false))
-                        .on_toggle(move |on| msg(GraphMsg::Set(set.clone(), Value::Bool(on))))
-                        .size(14)
-                        .width(Length::Fill)
-                        .into()
-                }
-                RowWidget::Field => {
-                    let draft = self.drafts.get(&port).cloned().unwrap_or(shown);
-                    let edit = port.clone();
-                    text_input("", &draft)
-                        .on_input(move |s| msg(GraphMsg::Input(edit.clone(), s)))
-                        .on_submit(msg(GraphMsg::Commit(port)))
-                        .size(11)
-                        .padding([2, 4])
-                        .width(Length::Fill)
-                        .into()
                 }
             }
-        } else {
-            text(shown).size(11).width(Length::Fill).into()
-        };
-        row![
-            in_port,
-            text(node_row.label).size(11).width(LABEL_W),
-            value,
-            out_port
-        ]
-        .spacing(2)
-        .height(ROW_H)
-        .align_y(iced::Center)
-        .into()
+            Renaming::Group(id) => {
+                if self.group(id).is_some_and(|group| group.name != wanted) {
+                    self.record();
+                    if let Some(group) = self.groups.iter_mut().find(|group| group.id == id) {
+                        group.name = wanted.to_owned();
+                    }
+                }
+            }
+        }
     }
 
     /// Pure canvas state; document and evaluation work is the app's.
@@ -910,32 +2503,7 @@ impl Graph {
                     self.toggled_categories.insert(category);
                 }
             }
-            GraphMsg::PalettePress(item) => self.drag = Some(Drag::Palette(*item)),
             GraphMsg::Search(value) => self.search = value.clone(),
-            GraphMsg::Moved(p) => {
-                self.cursor = *p;
-                match self.drag {
-                    Some(Drag::Node(id, grab)) => {
-                        let pos = self.to_graph(*p) - grab;
-                        if let Some(ui) = self.ui.get_mut(&id) {
-                            ui.pos = pos;
-                        }
-                    }
-                    Some(Drag::Pan(start, start_pan)) => self.pan = start_pan + (*p - start),
-                    _ => {}
-                }
-            }
-            GraphMsg::Pressed => self.drag = Some(Drag::Pan(self.cursor, self.pan)),
-            GraphMsg::NodePress(id) => {
-                // Raise the grabbed node above the others.
-                if let Some(index) = self.engine.nodes.iter().position(|node| node.id == *id) {
-                    let node = self.engine.nodes.remove(index);
-                    self.engine.nodes.push(node);
-                }
-                if let Some(ui) = self.ui.get(id) {
-                    self.drag = Some(Drag::Node(*id, self.to_graph(self.cursor) - ui.pos));
-                }
-            }
             GraphMsg::Section(id, title) => {
                 if let Some(ui) = self.ui.get_mut(id) {
                     if !ui.open.remove(title) {
@@ -943,131 +2511,255 @@ impl Graph {
                     }
                 }
             }
-            GraphMsg::OutPress(port) => self.drag = Some(Drag::Link(port.clone())),
-            GraphMsg::InPress(port) => {
-                // Grabbing a linked input detaches the link to re-route it.
-                if let Some(link) = self.engine.disconnect(port) {
-                    self.drag = Some(Drag::Link(link.from));
+            GraphMsg::RenameStart(id) => {
+                self.commit_rename();
+                self.renaming = Some((Renaming::Node(*id), self.name(*id)));
+            }
+            GraphMsg::GroupRenameStart(id) => {
+                self.commit_rename();
+                let name = self
+                    .group(*id)
+                    .map(|group| group.name.clone())
+                    .unwrap_or_default();
+                self.renaming = Some((Renaming::Group(*id), name));
+            }
+            GraphMsg::RenameInput(value) => {
+                if let Some((_, draft)) = &mut self.renaming {
+                    *draft = value.clone();
                 }
             }
-            GraphMsg::Zoom(delta) => {
-                let lines = match delta {
-                    mouse::ScrollDelta::Lines { y, .. } => *y,
-                    mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+            GraphMsg::RenameCommit => self.commit_rename(),
+            GraphMsg::Move(id, direction) => {
+                let links = self.move_breaks(*id, *direction);
+                if links.is_empty() {
+                    self.record();
+                    self.move_node(*id, *direction);
+                } else {
+                    self.confirm = Some(Confirm {
+                        action: GraphMsg::MoveNow(*id, *direction),
+                        node: *id,
+                        delete: false,
+                        links,
+                    });
+                }
+            }
+            GraphMsg::MoveNow(id, direction) => {
+                self.record();
+                self.move_node(*id, *direction);
+            }
+            GraphMsg::NodeDelete(id) => {
+                let links = self.dependents(*id);
+                if links.is_empty() {
+                    self.record();
+                    self.forget(*id);
+                } else {
+                    self.confirm = Some(Confirm {
+                        action: GraphMsg::DeleteNow(*id),
+                        node: *id,
+                        delete: true,
+                        links,
+                    });
+                }
+            }
+            GraphMsg::DeleteNow(id) => {
+                self.record();
+                self.forget(*id);
+            }
+            GraphMsg::ConfirmNo => self.confirm = None,
+            GraphMsg::Duplicate(id) => {
+                self.record();
+                self.duplicated = self.duplicate(*id).map(|copy| (*id, copy));
+            }
+            GraphMsg::Pick(port) => {
+                self.commit_rename();
+                self.picking = Some(port.clone());
+                self.pick_search.clear();
+            }
+            GraphMsg::PickSearch(value) => self.pick_search = value.clone(),
+            GraphMsg::PickCancel => self.picking = None,
+            GraphMsg::Choose(from) => {
+                if let Some(to) = self.picking.take() {
+                    self.record();
+                    self.engine.connect(from.clone(), to);
+                }
+            }
+            GraphMsg::PickNewInput(kind, value) => {
+                let (Some(to), Some(spec)) = (self.picking.take(), graph::spec(kind)) else {
+                    return;
                 };
-                if lines != 0.0 {
-                    // Keep the graph point under the cursor where it is.
-                    let anchor = self.to_graph(self.cursor);
-                    self.zoom_steps = (self.zoom_steps + lines.signum() as i32)
-                        .clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end());
-                    let zoom = self.zoom();
-                    self.pan = Vector::new(
-                        self.cursor.x - anchor.x * zoom,
-                        self.cursor.y - anchor.y * zoom,
-                    );
+                self.record();
+                let label = to.field.replace('_', " ");
+                let name =
+                    self.unique_name(&format!("{} {label}", self.name(to.node)), None, false);
+                let input = self.add_named(Kind::Op(spec), name, Vec::new());
+                if let Some(node) = self.engine.node_mut(input) {
+                    node.params.insert("value".to_owned(), value.clone());
+                }
+                self.engine.connect(
+                    Port {
+                        node: input,
+                        field: "value".to_owned(),
+                    },
+                    to,
+                );
+            }
+            GraphMsg::Unlink(port) => {
+                if self.engine.is_linked(port) {
+                    self.record();
+                    self.engine.disconnect(port);
+                }
+                if self.picking.as_ref() == Some(port) {
+                    self.picking = None;
                 }
             }
             GraphMsg::Input(port, value) => {
                 self.drafts.insert(port.clone(), value.clone());
             }
+            GraphMsg::Commit(port) => {
+                if self.drafts.contains_key(port) {
+                    self.record();
+                }
+            }
+            GraphMsg::Set(port, _) => {
+                // A slider drag sends many values; keep it one undo step.
+                if self.recording.as_ref() != Some(port) {
+                    self.record();
+                    self.recording = Some(port.clone());
+                }
+            }
+            GraphMsg::Zoom(steps) => {
+                self.zoom_steps = if *steps == 0 {
+                    0
+                } else {
+                    (self.zoom_steps + steps).clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end())
+                };
+            }
+            GraphMsg::ToggleSteps => {
+                self.steps_hidden = !self.steps_hidden;
+                self.picking = None;
+            }
+            GraphMsg::GroupNew(id) => {
+                self.record();
+                self.new_group(*id);
+            }
+            GraphMsg::GroupAssign(id, group) => {
+                if self.node_group(*id) != *group {
+                    self.record();
+                    if let Some(ui) = self.ui.get_mut(id) {
+                        ui.group = *group;
+                    }
+                    self.prune_groups();
+                }
+            }
+            GraphMsg::GroupCollapse(id) => {
+                if let Some(group) = self.groups.iter_mut().find(|group| group.id == *id) {
+                    group.collapsed = !group.collapsed;
+                }
+            }
+            GraphMsg::GroupColor(id) => {
+                self.record();
+                if let Some(group) = self.groups.iter_mut().find(|group| group.id == *id) {
+                    group.color = (group.color + 1) % NODE_COLORS.len();
+                }
+            }
+            GraphMsg::GroupDelete(id) => {
+                self.record();
+                for ui in self.ui.values_mut() {
+                    if ui.group == Some(*id) {
+                        ui.group = None;
+                    }
+                }
+                self.prune_groups();
+            }
+            GraphMsg::Undo => {
+                if let Some(snapshot) = self.undo.pop() {
+                    self.redo.push(self.snapshot());
+                    self.restore(snapshot);
+                }
+            }
+            GraphMsg::Redo => {
+                if let Some(snapshot) = self.redo.pop() {
+                    self.undo.push(self.snapshot());
+                    self.restore(snapshot);
+                }
+            }
             _ => {}
         }
     }
-}
 
-fn port_dot<'a>(linked: bool) -> Element<'a, Message> {
-    container(
-        container(Space::new())
-            .width(8.0)
-            .height(8.0)
-            .style(move |theme: &Theme| {
-                let palette = theme.palette();
-                container::Style {
-                    background: linked.then_some(Background::Color(palette.primary.base.color)),
-                    border: Border {
-                        color: palette.primary.base.color,
-                        width: 1.5,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }
-            }),
-    )
-    .width(PORT_W)
-    .height(ROW_H)
-    .align_x(iced::Center)
-    .align_y(iced::Center)
-    .into()
-}
-
-/// Translucent backdrop plus link curves.
-struct Wires {
-    wires: Vec<(Point, Point)>,
-    pending: Option<(Point, Point)>,
-    width: f32,
-}
-
-fn wire_path(a: Point, b: Point) -> canvas::Path {
-    let dx = ((b.x - a.x).abs() * 0.5).max(40.0);
-    canvas::Path::new(|path| {
-        path.move_to(a);
-        path.bezier_curve_to(Point::new(a.x + dx, a.y), Point::new(b.x - dx, b.y), b);
-    })
-}
-
-impl canvas::Program<Message> for Wires {
-    type State = ();
-
-    fn draw(
-        &self,
-        _state: &(),
-        renderer: &iced::Renderer,
-        theme: &Theme,
-        bounds: Rectangle,
-        _cursor: mouse::Cursor,
-    ) -> Vec<canvas::Geometry> {
-        let palette = theme.palette();
-        let mut frame = canvas::Frame::new(renderer, bounds.size());
-        frame.fill_rectangle(
-            Point::ORIGIN,
-            bounds.size(),
-            palette.background.base.color.scale_alpha(0.6),
-        );
-        let stroke = canvas::Stroke::default()
-            .with_color(palette.primary.base.color)
-            .with_width(self.width);
-        for (a, b) in &self.wires {
-            frame.stroke(&wire_path(*a, *b), stroke);
+    /// Clears the canvas state that points at `id`, ahead of its removal.
+    fn forget(&mut self, id: NodeId) {
+        if self.picking.as_ref().is_some_and(|port| port.node == id) {
+            self.picking = None;
         }
-        if let Some((a, b)) = self.pending {
-            frame.stroke(
-                &wire_path(a, b),
-                stroke.with_color(palette.primary.weak.color),
-            );
+        if self.renaming.as_ref().map(|(target, _)| *target) == Some(Renaming::Node(id)) {
+            self.renaming = None;
         }
-        vec![frame.into_geometry()]
+    }
+
+    /// Removes `id` from the graph, returning the entities it owned.
+    pub fn remove_node(&mut self, id: NodeId) -> Vec<Handle> {
+        self.engine.remove(id);
+        self.drafts.retain(|port, _| port.node != id);
+        let handles = self.ui.remove(&id).map(|ui| ui.handles).unwrap_or_default();
+        self.prune_groups();
+        handles
     }
 }
 
-/// Lays its content out in graph space and draws and hit-tests it through
-/// `zoom`, so every widget inside scales as one picture.
-struct Zoomed<'a> {
+/// `card` centred over a dimmed backdrop; a click on the backdrop sends
+/// `dismiss`.
+fn modal<'a>(card: Element<'a, Message>, dismiss: GraphMsg) -> Element<'a, Message> {
+    stack![
+        mouse_area(
+            container(Space::new())
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .style(|_: &Theme| container::Style {
+                    background: Some(Background::Color(Color::BLACK.scale_alpha(0.25))),
+                    ..Default::default()
+                })
+        )
+        .on_press(msg(dismiss)),
+        center(opaque(card)),
+    ]
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
+/// Lays its content out at natural size and draws and hit-tests it scaled by
+/// `zoom` from its top-left, reporting the scaled size so a surrounding
+/// scrollable scrolls the zoomed picture. Ctrl + wheel over it zooms. Its
+/// content's overlays (tooltips, lists) are scaled the same way.
+struct Scaled<'a> {
     content: Element<'a, Message>,
     zoom: f32,
 }
 
-impl Zoomed<'_> {
-    /// Content coordinates → screen, for a layer whose top-left is `origin`.
-    fn transformation(&self, origin: Point) -> Transformation {
-        Transformation::translate(origin.x, origin.y)
-            * Transformation::scale(self.zoom)
-            * Transformation::translate(-origin.x, -origin.y)
-    }
+#[derive(Default)]
+struct ScaledState {
+    modifiers: iced::keyboard::Modifiers,
 }
 
-impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
+/// Scaling by `zoom` about `origin`.
+fn scale_about(origin: Point, zoom: f32) -> Transformation {
+    Transformation::translate(origin.x, origin.y)
+        * Transformation::scale(zoom)
+        * Transformation::translate(-origin.x, -origin.y)
+}
+
+impl Widget<Message, Theme, iced::Renderer> for Scaled<'_> {
+    fn tag(&self) -> widget::tree::Tag {
+        widget::tree::Tag::of::<ScaledState>()
+    }
+
+    fn state(&self) -> widget::tree::State {
+        widget::tree::State::new(ScaledState::default())
+    }
+
     fn size(&self) -> Size<Length> {
-        Size::new(Length::Fill, Length::Fill)
+        Size::new(Length::Shrink, Length::Shrink)
     }
 
     fn diff(&mut self, tree: &mut widget::Tree) {
@@ -1080,12 +2772,12 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         renderer: &iced::Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let size = limits.max();
-        let inner = layout::Limits::new(Size::ZERO, size * (1.0 / self.zoom));
+        let inner = layout::Limits::new(Size::ZERO, limits.max() * (1.0 / self.zoom));
         let content = self
             .content
             .as_widget_mut()
             .layout(&mut tree.children[0], renderer, &inner);
+        let size = content.size() * self.zoom;
         layout::Node::with_children(size, vec![content])
     }
 
@@ -1099,7 +2791,27 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let inverse = self.transformation(layout.position()).inverse();
+        match event {
+            iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                tree.state.downcast_mut::<ScaledState>().modifiers = *modifiers;
+            }
+            iced::Event::Mouse(mouse::Event::WheelScrolled { delta })
+                if tree.state.downcast_ref::<ScaledState>().modifiers.command()
+                    && cursor.is_over(*viewport) =>
+            {
+                let lines = match delta {
+                    mouse::ScrollDelta::Lines { y, .. } => *y,
+                    mouse::ScrollDelta::Pixels { y, .. } => *y / 40.0,
+                };
+                if lines != 0.0 {
+                    shell.publish(msg(GraphMsg::Zoom(lines.signum() as i32)));
+                }
+                shell.capture_event();
+                return;
+            }
+            _ => {}
+        }
+        let inverse = scale_about(layout.position(), self.zoom).inverse();
         let Some(content) = layout.children().next() else {
             return;
         };
@@ -1122,7 +2834,7 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        let inverse = self.transformation(layout.position()).inverse();
+        let inverse = scale_about(layout.position(), self.zoom).inverse();
         layout
             .children()
             .next()
@@ -1162,15 +2874,18 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
         style: &renderer::Style,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        _viewport: &Rectangle,
+        viewport: &Rectangle,
     ) {
         let Some(content) = layout.children().next() else {
             return;
         };
         let bounds = layout.bounds();
-        let transformation = self.transformation(bounds.position());
+        let transformation = scale_about(bounds.position(), self.zoom);
         let inverse = transformation.inverse();
-        renderer.with_layer(bounds, |renderer| {
+        let Some(clip) = bounds.intersection(viewport) else {
+            return;
+        };
+        renderer.with_layer(clip, |renderer| {
             renderer.with_transformation(transformation, |renderer| {
                 self.content.as_widget().draw(
                     &tree.children[0],
@@ -1179,15 +2894,302 @@ impl Widget<Message, Theme, iced::Renderer> for Zoomed<'_> {
                     style,
                     content,
                     cursor * inverse,
-                    &(bounds * inverse),
+                    &(clip * inverse),
                 );
             });
         });
     }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut widget::Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        let local = scale_about(layout.position(), self.zoom);
+        // On screen the content sits at its layout position plus
+        // `translation`, scaled about that point.
+        let transformation = scale_about(layout.position() + translation, self.zoom);
+        let zoom = self.zoom;
+        let content = layout.children().next()?;
+        let inner = self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            content,
+            renderer,
+            &(*viewport * local.inverse()),
+            translation,
+        )?;
+        Some(overlay::Element::new(Box::new(ScaledOverlay {
+            inner,
+            transformation,
+            zoom,
+        })))
+    }
 }
 
-impl<'a> From<Zoomed<'a>> for Element<'a, Message> {
-    fn from(zoomed: Zoomed<'a>) -> Self {
-        Element::new(zoomed)
+impl<'a> From<Scaled<'a>> for Element<'a, Message> {
+    fn from(scaled: Scaled<'a>) -> Self {
+        Element::new(scaled)
+    }
+}
+
+/// An overlay of [`Scaled`] content, drawn and hit-tested through the same
+/// scaling. Its layout reports the scaled bounds, so the runtime routes the
+/// cursor to it where it is actually drawn.
+struct ScaledOverlay<'a> {
+    inner: overlay::Element<'a, Message, Theme, iced::Renderer>,
+    transformation: Transformation,
+    zoom: f32,
+}
+
+impl overlay::Overlay<Message, Theme, iced::Renderer> for ScaledOverlay<'_> {
+    fn layout(&mut self, renderer: &iced::Renderer, bounds: Size) -> layout::Node {
+        let node = self
+            .inner
+            .as_overlay_mut()
+            .layout(renderer, bounds * (1.0 / self.zoom));
+        let unscaled = node.bounds();
+        let scaled = unscaled * self.transformation;
+        // The child keeps its unscaled absolute position under the scaled
+        // parent.
+        let child = node.move_to(Point::new(unscaled.x - scaled.x, unscaled.y - scaled.y));
+        layout::Node::with_children(scaled.size(), vec![child]).move_to(scaled.position())
+    }
+
+    fn draw(
+        &self,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+    ) {
+        let Some(child) = layout.children().next() else {
+            return;
+        };
+        let inverse = self.transformation.inverse();
+        renderer.with_transformation(self.transformation, |renderer| {
+            self.inner
+                .as_overlay()
+                .draw(renderer, theme, style, child, cursor * inverse);
+        });
+    }
+
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn widget::Operation,
+    ) {
+        if let Some(child) = layout.children().next() {
+            self.inner
+                .as_overlay_mut()
+                .operate(child, renderer, operation);
+        }
+    }
+
+    fn update(
+        &mut self,
+        event: &iced::Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        if let Some(child) = layout.children().next() {
+            self.inner.as_overlay_mut().update(
+                event,
+                child,
+                cursor * self.transformation.inverse(),
+                renderer,
+                shell,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        layout
+            .children()
+            .next()
+            .map_or(mouse::Interaction::None, |child| {
+                self.inner.as_overlay().mouse_interaction(
+                    child,
+                    cursor * self.transformation.inverse(),
+                    renderer,
+                )
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn op(name: &str) -> PaletteItem {
+        PaletteItem::Op(graph::spec(name).unwrap())
+    }
+
+    fn port(node: NodeId, field: &str) -> Port {
+        Port {
+            node,
+            field: field.to_owned(),
+        }
+    }
+
+    fn link(graph: &mut Graph, from: Port, to: Port) {
+        graph.update_ui(&GraphMsg::Pick(to));
+        graph.update_ui(&GraphMsg::Choose(from));
+    }
+
+    #[test]
+    fn nodes_of_one_type_get_distinct_names() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(op("Add"), Vec::new());
+        let b = graph.add_node(op("Add"), Vec::new());
+        assert_ne!(graph.name(a), graph.name(b));
+        graph.update_ui(&GraphMsg::RenameStart(b));
+        graph.update_ui(&GraphMsg::RenameInput(graph.name(a).to_uppercase()));
+        graph.update_ui(&GraphMsg::RenameCommit);
+        assert_ne!(graph.name(a).to_lowercase(), graph.name(b).to_lowercase());
+    }
+
+    #[test]
+    fn a_move_that_breaks_links_asks_first() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let first = graph.add_node(op("Add"), Vec::new());
+        let second = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(input, "value"), port(first, "a"));
+        link(&mut graph, port(first, "result"), port(second, "x"));
+        assert_eq!(graph.engine.links.len(), 2);
+        assert!(graph.picking.is_none());
+
+        graph.update_ui(&GraphMsg::Move(second, -1));
+        let confirm = graph.confirm.clone().expect("the move asks");
+        assert_eq!(confirm.links.len(), 1);
+        assert_eq!(graph.steps()[&second], 1, "nothing moved yet");
+
+        graph.update_ui(&GraphMsg::ConfirmYes);
+        graph.confirm = None;
+        graph.update_ui(&confirm.action);
+        assert_eq!(graph.steps()[&second], 0);
+        assert!(!graph.engine.is_linked(&port(second, "x")));
+        assert!(graph.engine.is_linked(&port(first, "a")));
+
+        graph.update_ui(&GraphMsg::Undo);
+        assert_eq!(graph.steps()[&second], 1);
+        assert!(graph.engine.is_linked(&port(second, "x")));
+        graph.update_ui(&GraphMsg::Redo);
+        assert_eq!(graph.steps()[&second], 0);
+    }
+
+    #[test]
+    fn deleting_a_used_node_asks_first() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let step = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(input, "value"), port(step, "x"));
+        graph.update_ui(&GraphMsg::NodeDelete(input));
+        assert!(graph.confirm.as_ref().is_some_and(|confirm| confirm.delete));
+        graph.update_ui(&GraphMsg::NodeDelete(step));
+        assert!(graph
+            .confirm
+            .as_ref()
+            .is_some_and(|confirm| confirm.node == input));
+    }
+
+    #[test]
+    fn duplicates_keep_values_and_sources() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let step = graph.add_node(op("Add"), Vec::new());
+        let last = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(input, "value"), port(step, "a"));
+        graph
+            .engine
+            .node_mut(step)
+            .unwrap()
+            .params
+            .insert("b".into(), json!(7));
+        graph.update_ui(&GraphMsg::Duplicate(step));
+        let (original, copy) = graph.duplicated.unwrap();
+        assert_eq!(original, step);
+        assert_eq!(graph.steps()[&copy], 1, "right after the original");
+        assert_eq!(graph.steps()[&last], 2);
+        assert!(graph.engine.is_linked(&port(copy, "a")));
+        assert_eq!(graph.engine.node(copy).unwrap().params["b"], json!(7));
+        assert_ne!(graph.name(copy), graph.name(step));
+        graph.update_ui(&GraphMsg::Undo);
+        assert!(graph.engine.node(copy).is_none());
+    }
+
+    #[test]
+    fn the_picker_can_create_the_input_it_links() {
+        let mut graph = Graph::default();
+        let step = graph.add_node(op("Add"), Vec::new());
+        graph.update_ui(&GraphMsg::Pick(port(step, "b")));
+        graph.update_ui(&GraphMsg::PickNewInput("Number", json!(3)));
+        let link = graph.engine.links.first().expect("linked");
+        let input = graph.engine.node(link.from.node).unwrap();
+        assert!(is_input(&input.kind));
+        assert_eq!(input.params["value"], json!(3));
+        assert_eq!(link.to, port(step, "b"));
+    }
+
+    #[test]
+    fn moving_across_a_group_edge_joins_the_group() {
+        let mut graph = Graph::default();
+        let a = graph.add_node(op("Pi"), Vec::new());
+        let b = graph.add_node(op("E"), Vec::new());
+        graph.update_ui(&GraphMsg::GroupNew(b));
+        let group = graph.node_group(b);
+        assert!(group.is_some());
+        graph.update_ui(&GraphMsg::Move(a, 1));
+        assert_eq!(graph.node_group(a), group, "joined in place");
+        assert_eq!(graph.steps()[&a], 0);
+        graph.update_ui(&GraphMsg::Move(a, 1));
+        assert_eq!(graph.steps()[&a], 1, "then moves within it");
+        graph.update_ui(&GraphMsg::GroupDelete(group.unwrap()));
+        assert!(graph.groups.is_empty());
+    }
+
+    #[test]
+    fn picker_types_dim_what_does_not_fit() {
+        assert!(Expect::Number.fits(&json!(2.5)));
+        assert!(Expect::Number.fits(&json!([1, 2])));
+        assert!(!Expect::Number.fits(&json!("abc")));
+        assert!(Expect::Text.fits(&json!(4)));
+        assert!(!Expect::Bool.fits(&json!(1)));
+        assert!(Expect::Object.fits(&json!({ "handle": 5 })));
+        assert!(Expect::Any.fits(&json!({ "rgb": [1, 2, 3] })));
+    }
+
+    #[test]
+    fn saved_graphs_keep_names_order_groups_and_view() {
+        let mut graph = Graph::default();
+        graph.add_node(op("Number"), Vec::new());
+        let a = graph.add_node(op("Add"), Vec::new());
+        let b = graph.add_node(op("Add"), Vec::new());
+        graph.update_ui(&GraphMsg::RenameStart(a));
+        graph.update_ui(&GraphMsg::RenameInput("Width".into()));
+        graph.update_ui(&GraphMsg::RenameCommit);
+        graph.update_ui(&GraphMsg::Move(b, -1));
+        graph.update_ui(&GraphMsg::GroupNew(a));
+        graph.update_ui(&GraphMsg::Zoom(3));
+        graph.update_ui(&GraphMsg::ToggleSteps);
+        let (loaded, _) = Graph::from_file(&graph.to_file("")).unwrap();
+        assert_eq!(loaded.name(a), "Width");
+        assert_eq!(loaded.steps()[&b], 0);
+        assert_eq!(loaded.groups.len(), 1);
+        assert_eq!(loaded.node_group(a), graph.node_group(a));
+        assert_eq!(loaded.zoom_steps, 3);
+        assert!(loaded.steps_hidden);
     }
 }

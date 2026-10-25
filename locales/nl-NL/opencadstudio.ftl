@@ -6441,6 +6441,7 @@ dock =
     .new-group = Nieuwe groep
     .browser = Browser
     .node-graph = Knooppuntgrafiek
+    .node-sequence = Knooppuntreeks
 
 graphic-attributes =
     .title = Grafische attributen

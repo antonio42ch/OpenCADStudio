@@ -6455,6 +6455,7 @@ dock =
     .new-group = مجموعة جديدة
     .browser = المستعرض
     .node-graph = مخطط العقد
+    .node-sequence = تسلسل العقد
 
 graphic-attributes =
     .title = سمات الرسم

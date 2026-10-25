@@ -6431,6 +6431,7 @@ dock =
     .new-group = 新しいグループ
     .browser = ブラウザー
     .node-graph = ノードグラフ
+    .node-sequence = ノードシーケンス
 
 graphic-attributes =
     .title = グラフィック属性

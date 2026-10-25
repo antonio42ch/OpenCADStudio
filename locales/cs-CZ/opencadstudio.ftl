@@ -6440,6 +6440,7 @@ dock =
     .new-group = Nová skupina
     .browser = Prohlížeč
     .node-graph = Graf uzlů
+    .node-sequence = Sekvence uzlů
 
 graphic-attributes =
     .title = Grafické atributy

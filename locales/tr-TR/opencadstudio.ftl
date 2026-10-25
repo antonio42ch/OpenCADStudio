@@ -6366,6 +6366,7 @@ dock =
     .new-group = Yeni grup
     .browser = Tarayıcı
     .node-graph = Düğüm Grafiği
+    .node-sequence = Düğüm Dizisi
 
 graphic-attributes =
     .title = Grafik öznitelikleri
