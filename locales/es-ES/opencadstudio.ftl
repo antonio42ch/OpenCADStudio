@@ -7100,6 +7100,7 @@ node-graph =
     .steps-count = __ocs_fmt_0__ pasos
     .draw-geometry = Dibujar geometría
     .expects-curve = Espera una curva
+    .expects-plane = Espera un plano
     .show-preview = Mostrar vista previa
     .hide-preview = Ocultar vista previa
     .automation-changed = Grafo de nodos modificado por un cliente de automatización (__ocs_fmt_0__ cambios)

@@ -6190,6 +6190,7 @@ pub(super) fn message_attribute(source: &str) -> Option<(&'static str, &'static 
         "{} steps" => Some(("node-graph", "steps-count")),
         "Draw Geometry" => Some(("node-graph", "draw-geometry")),
         "Expects a curve" => Some(("node-graph", "expects-curve")),
+        "Expects a plane" => Some(("node-graph", "expects-plane")),
         "Show preview" => Some(("node-graph", "show-preview")),
         "Hide preview" => Some(("node-graph", "hide-preview")),
         "Node graph changed by an automation client ({} changes)" => Some(("node-graph", "automation-changed")),

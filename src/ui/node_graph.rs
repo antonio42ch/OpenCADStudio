@@ -322,6 +322,8 @@ pub(crate) enum Expect {
     Object,
     /// A curve value or a drawn object: anything a curve node reads.
     Curve,
+    /// A plane value: a frame to place or orient geometry in.
+    Plane,
 }
 
 impl Expect {
@@ -332,6 +334,7 @@ impl Expect {
             Value::Bool(_) => Expect::Bool,
             Value::Object(object) if object.contains_key("handle") => Expect::Object,
             Value::Object(object) if object.contains_key("curve") => Expect::Curve,
+            Value::Object(object) if object.contains_key("plane") => Expect::Plane,
             Value::Object(_) if graph::value::point(value).is_some() => Expect::Point,
             _ => Expect::Any,
         }
@@ -357,6 +360,7 @@ impl Expect {
                 Expect::Curve => {
                     value.get("handle").is_some() || graph::value::curve(value).is_some()
                 }
+                Expect::Plane => graph::value::plane(value).is_some(),
             },
         }
     }
@@ -371,6 +375,7 @@ impl Expect {
             Expect::Point => "point",
             Expect::Object => "object",
             Expect::Curve => "curve",
+            Expect::Plane => "plane",
         }
     }
 
@@ -396,6 +401,7 @@ impl Expect {
             Expect::Point => Some("Expects a point"),
             Expect::Object => Some("Expects an object"),
             Expect::Curve => Some("Expects a curve"),
+            Expect::Plane => Some("Expects a plane"),
         }
     }
 
@@ -405,7 +411,7 @@ impl Expect {
             Expect::Any | Expect::Number => Some("Number"),
             Expect::Text => Some("Text"),
             Expect::Bool => Some("Boolean"),
-            Expect::Point | Expect::Object | Expect::Curve => None,
+            Expect::Point | Expect::Object | Expect::Curve | Expect::Plane => None,
         }
     }
 }
@@ -547,7 +553,18 @@ pub fn display(value: &Value) -> String {
                     _ => kind.to_owned(),
                 }
             }
-            (None, None) => value.to_string(),
+            (None, None) => match graph::value::plane(value) {
+                Some(plane) => {
+                    let p = plane.origin;
+                    format!(
+                        "plane ({}, {}, {})",
+                        number(p[0]),
+                        number(p[1]),
+                        number(p[2])
+                    )
+                }
+                None => value.to_string(),
+            },
         },
         other => graph::value::text(other),
     }
@@ -1312,7 +1329,9 @@ impl Graph {
                     graph::ops::Initial::Bool(_) => Expect::Bool,
                     graph::ops::Initial::None => match input.name {
                         "curve" => Expect::Curve,
-                        "point" | "center" => Expect::Point,
+                        "point" | "center" | "vector" | "origin" | "x_axis" | "y_axis"
+                        | "start" | "end" | "direction" | "corner" | "from_point" => Expect::Point,
+                        "plane" | "from" | "to" => Expect::Plane,
                         _ => Expect::Any,
                     },
                 }

@@ -194,10 +194,12 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
                         label: (*name).to_owned(),
                         input: false,
                         output: true,
-                        kind: if *name == "curve" {
-                            Expect::Curve
-                        } else {
-                            Expect::Any
+                        kind: match *name {
+                            "curve" | "curves" => Expect::Curve,
+                            "point" | "vector" | "origin" | "x_axis" | "y_axis" | "normal"
+                            | "start" | "end" => Expect::Point,
+                            "plane" => Expect::Plane,
+                            _ => Expect::Any,
                         },
                     }),
             );
@@ -1583,5 +1585,62 @@ mod tests {
         let drawn = apply_changes(&mut app, "p2", Value::Array(changes));
         assert_eq!(drawn["ok"], true, "{drawn}");
         assert_eq!(count_lines(&mut app, "LwPolyline"), 1, "{drawn}");
+    }
+
+    #[test]
+    fn transforms_and_arrays_draw_through_one_draw_node() {
+        let mut app = app();
+        let built = apply_changes(
+            &mut app,
+            "t1",
+            json!([
+                {"add": "Number", "name": "Step", "values": {"value": 15}},
+                {"add": "Rectangle", "name": "Room"},
+                {"add": "Fillet Corners", "name": "Rounded"},
+                {"link": "Room.curve", "to": "Rounded.curve"},
+                {"add": "Vector", "name": "Offset"},
+                {"link": "Step.value", "to": "Offset.x"},
+                {"add": "Linear Array", "name": "Rooms"},
+                {"link": "Rounded.curve", "to": "Rooms.geometry"},
+                {"link": "Offset.vector", "to": "Rooms.vector"},
+                {"add": "Draw Geometry", "name": "Plan"},
+                {"link": "Rooms.geometry", "to": "Plan.geometry"},
+                {"add": "Rotate", "name": "Turned"},
+                {"link": "Room.curve", "to": "Turned.geometry"},
+                {"add": "Draw Geometry", "name": "Turned plan"},
+                {"link": "Turned.geometry", "to": "Turned plan.geometry"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        assert_eq!(built["result"]["warnings"], json!([]), "{built}");
+        // Three arrayed rooms and the turned one, all drawn polylines.
+        assert_eq!(count_lines(&mut app, "LwPolyline"), 4, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            node(&state, "sequence", "Plan")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+
+        let library = read(&mut app, "graph_library", json!({"search": "Transform"}));
+        let names: Vec<&str> = library["types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|ty| ty["type"].as_str())
+            .collect();
+        for name in [
+            "Move",
+            "Rotate",
+            "Scale",
+            "Mirror",
+            "Orient",
+            "Linear Array",
+            "Polar Array",
+            "Curve Array",
+        ] {
+            assert!(names.contains(&name), "{name} in {names:?}");
+        }
     }
 }

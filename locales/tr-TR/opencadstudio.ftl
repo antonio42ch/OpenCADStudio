@@ -7021,6 +7021,7 @@ node-graph =
     .steps-count = __ocs_fmt_0__ steps
     .draw-geometry = Draw Geometry
     .expects-curve = Expects a curve
+    .expects-plane = Expects a plane
     .show-preview = Show preview
     .hide-preview = Hide preview
     .automation-changed = Node graph changed by an automation client (__ocs_fmt_0__ changes)

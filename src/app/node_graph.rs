@@ -303,7 +303,8 @@ impl OpenCADStudio {
         }
     }
 
-    /// Draws a Draw node's curve values: one entity per curve, reusing the
+    /// Draws a Draw node's curve values: one entity per curve (lists drawn
+    /// whole), reusing the
     /// node's entities of the same kind, on the given layer and colour (the
     /// current layer and ByLayer when unset). Curves no entity can hold are
     /// skipped; entities left over are erased.
@@ -330,12 +331,9 @@ impl OpenCADStudio {
                     .map(|(_, value)| value.clone())
             };
             let geometry = get("geometry").unwrap_or(Value::Null);
-            let Some(mut entity) = graph::value::curve(&geometry)
-                .as_ref()
-                .and_then(crate::entities::curve::curve_entity)
-            else {
-                continue;
-            };
+            // Nested lists (an array of arrays) draw every curve they hold.
+            let mut curves = Vec::new();
+            collect_curves(&geometry, &mut curves);
             let document = &self.tabs[i].scene.document;
             let layer = get("layer")
                 .map(|value| graph::value::text(&value).trim().to_owned())
@@ -349,34 +347,50 @@ impl OpenCADStudio {
                     }),
                 _ => codec::types::Color::ByLayer,
             };
-            let reuse = spare.iter().position(|handle| {
-                document.get_entity(*handle).is_some_and(|existing| {
-                    std::mem::discriminant(existing) == std::mem::discriminant(&entity)
-                })
-            });
-            let handle = match reuse {
-                Some(k) => {
-                    let handle = spare.remove(k);
-                    if let Some(existing) = self.tabs[i].scene.document.get_entity(handle) {
-                        *entity.common_mut() = existing.common().clone();
+            let mut objects = Vec::new();
+            for curve in curves {
+                let Some(mut entity) = crate::entities::curve::curve_entity(&curve) else {
+                    continue;
+                };
+                let document = &self.tabs[i].scene.document;
+                let reuse = spare.iter().position(|handle| {
+                    document.get_entity(*handle).is_some_and(|existing| {
+                        std::mem::discriminant(existing) == std::mem::discriminant(&entity)
+                    })
+                });
+                let handle = match reuse {
+                    Some(k) => {
+                        let handle = spare.remove(k);
+                        if let Some(existing) = self.tabs[i].scene.document.get_entity(handle) {
+                            *entity.common_mut() = existing.common().clone();
+                        }
+                        entity.common_mut().layer = layer.clone();
+                        entity.common_mut().color = color;
+                        self.tabs[i].scene.update_entity(entity);
+                        handle
                     }
-                    entity.common_mut().layer = layer.clone();
-                    entity.common_mut().color = color;
-                    self.tabs[i].scene.update_entity(entity);
-                    handle
-                }
-                None => {
-                    entity.common_mut().handle = Handle::NULL;
-                    entity.common_mut().layer = layer.clone();
-                    entity.common_mut().color = color;
-                    let Some(handle) = self.commit_entity_handle_preserve_style(entity) else {
-                        continue;
-                    };
-                    handle
-                }
+                    None => {
+                        entity.common_mut().handle = Handle::NULL;
+                        entity.common_mut().layer = layer.clone();
+                        entity.common_mut().color = color;
+                        let Some(handle) = self.commit_entity_handle_preserve_style(entity) else {
+                            continue;
+                        };
+                        handle
+                    }
+                };
+                self.tabs[i].dirty = true;
+                drawn.push(handle);
+                objects.push(json!({ "handle": handle.value() }));
+            }
+            if objects.is_empty() {
+                continue;
+            }
+            let object = if objects.len() == 1 {
+                objects.remove(0)
+            } else {
+                Value::Array(objects)
             };
-            self.tabs[i].dirty = true;
-            drawn.push(handle);
             results.push(vec![
                 ("geometry".to_owned(), geometry),
                 ("layer".to_owned(), json!(layer)),
@@ -387,7 +401,7 @@ impl OpenCADStudio {
                         _ => json!("ByLayer"),
                     },
                 ),
-                ("object".to_owned(), json!({ "handle": handle.value() })),
+                ("object".to_owned(), object),
             ]);
         }
         if !spare.is_empty() {
@@ -790,6 +804,15 @@ impl graph::Host for AppHost<'_> {
     }
 }
 
+/// Every curve in `value`, through nested lists.
+fn collect_curves(value: &Value, curves: &mut Vec<kernel::space::PlanarCurve>) {
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| collect_curves(item, curves)),
+        Value::Object(_) => curves.extend(graph::value::curve(value)),
+        _ => {}
+    }
+}
+
 /// Whether `kind` is the Draw Geometry node.
 fn is_draw(kind: &Kind) -> bool {
     matches!(kind, Kind::Object(name) if name == ObjectKind::Draw.name())
@@ -801,13 +824,6 @@ const PREVIEW_COLOR: [f32; 4] = [1.0, 0.55, 0.1, 0.9];
 /// The curves operation nodes compute, as overlay wires. Drawn objects show
 /// themselves; unbounded curves (rays, construction lines) are left out.
 fn preview_wires(graph: &crate::ui::node_graph::Graph) -> Vec<crate::scene::WireModel> {
-    fn walk(value: &Value, curves: &mut Vec<kernel::space::PlanarCurve>) {
-        match value {
-            Value::Array(items) => items.iter().for_each(|item| walk(item, curves)),
-            Value::Object(_) => curves.extend(graph::value::curve(value)),
-            _ => {}
-        }
-    }
     let mut wires = Vec::new();
     for node in &graph.engine.nodes {
         if !matches!(node.kind, Kind::Op(_)) {
@@ -816,7 +832,7 @@ fn preview_wires(graph: &crate::ui::node_graph::Graph) -> Vec<crate::scene::Wire
         let mut curves = Vec::new();
         node.outputs
             .values()
-            .for_each(|value| walk(value, &mut curves));
+            .for_each(|value| collect_curves(value, &mut curves));
         for (k, curve) in curves.into_iter().enumerate() {
             if curve.curve.extent() != kernel::geom2d::Extent::Bounded {
                 continue;
