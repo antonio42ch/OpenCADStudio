@@ -4835,6 +4835,7 @@ impl Scene {
             || (self.interim_wire.is_none()
                 && self.preview_wires.is_empty()
                 && self.constraint_hover_wires.is_empty()
+                && self.graph_preview_wires.is_empty()
                 && cloud_2d_wires.is_empty())
         {
             Arc::new(Vec::new())
@@ -4842,6 +4843,7 @@ impl Scene {
             let mut v: Vec<WireModel> = Vec::with_capacity(
                 self.preview_wires.len()
                     + self.constraint_hover_wires.len()
+                    + self.graph_preview_wires.len()
                     + cloud_2d_wires.len()
                     + 1,
             );
@@ -4850,6 +4852,7 @@ impl Scene {
             }
             v.extend(self.preview_wires.iter().cloned());
             v.extend(self.constraint_hover_wires.iter().cloned());
+            v.extend(self.graph_preview_wires.iter().cloned());
             v.extend(cloud_2d_wires);
             Arc::new(v)
         };

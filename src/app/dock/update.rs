@@ -556,7 +556,10 @@ impl OpenCADStudio {
             }
             PanelId::ExternalReferences => self.show_external_references = false,
             PanelId::Browser => self.show_browser = false,
-            PanelId::NodeGraph => self.show_node_graph = false,
+            PanelId::NodeGraph => {
+                self.show_node_graph = false;
+                self.graph_refresh_preview();
+            }
             PanelId::PointCloudManager => self.pc_manager.show = false,
             PanelId::Count => {
                 self.count_palette.show = false;

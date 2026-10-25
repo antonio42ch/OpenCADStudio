@@ -569,8 +569,124 @@ fn normalized(normal: Vector3) -> Vector3 {
     unit_vector(normal).unwrap_or(Vector3::new(0.0, 0.0, 1.0))
 }
 
+/// The entity that draws `curve`: the inverse of [`entity_curve`] for the
+/// kinds a curve value can hold.
+///
+/// Lines, rays and construction lines store world coordinates and come out
+/// on any plane. Circles, arcs and polylines store OCS coordinates, so their
+/// plane must be the OCS of its own normal at some elevation — which every
+/// plane parallel to world XY is; on any other plane they give `None` rather
+/// than a shape moved onto a different frame.
+pub fn curve_entity(curve: &PlanarCurve) -> Option<EntityType> {
+    use codec::entities as e;
+    use codec::types::Vector2;
+    let plane = curve.plane;
+    let world = |uv: [f64; 2]| vector3(Vec3::from(plane.point_at(uv)));
+    let normal = Vec3::from(plane.x_axis)
+        .cross(Vec3::from(plane.y_axis))
+        .normalize()?;
+    let elevation = Vec3::from(plane.origin).dot(normal);
+    let ocs = ocs_plane(vector3(normal), elevation);
+    let close = |a: [f64; 3], b: [f64; 3]| a.iter().zip(b).all(|(p, q)| (p - q).abs() <= 1e-9);
+    let in_ocs = close(ocs.origin, plane.origin)
+        && close(ocs.x_axis, plane.x_axis)
+        && close(ocs.y_axis, plane.y_axis);
+    let entity = match &curve.curve {
+        Curve::Line(line) => {
+            let (start, end) = (world(line.start), world(line.end));
+            EntityType::Line(e::Line::from_coords(
+                start.x, start.y, start.z, end.x, end.y, end.z,
+            ))
+        }
+        Curve::Ray(ray) => {
+            let origin = world(ray.origin);
+            let through = world([
+                ray.origin[0] + ray.direction[0],
+                ray.origin[1] + ray.direction[1],
+            ]);
+            EntityType::Ray(e::Ray::new(origin, through - origin))
+        }
+        Curve::XLine(line) => {
+            let base = world(line.base);
+            let through = world([
+                line.base[0] + line.direction[0],
+                line.base[1] + line.direction[1],
+            ]);
+            EntityType::XLine(e::XLine::new(base, through - base))
+        }
+        Curve::Circle(circle) if in_ocs => {
+            let mut entity = e::Circle::from_coords(
+                circle.centre[0],
+                circle.centre[1],
+                elevation,
+                circle.radius,
+            );
+            entity.normal = vector3(normal);
+            EntityType::Circle(entity)
+        }
+        Curve::Arc(arc) if in_ocs => {
+            let mut entity = e::Arc::from_coords(
+                arc.centre[0],
+                arc.centre[1],
+                elevation,
+                arc.radius,
+                arc.start_angle,
+                arc.end_angle,
+            );
+            entity.normal = vector3(normal);
+            EntityType::Arc(entity)
+        }
+        Curve::Polyline(polyline) if in_ocs => {
+            let mut entity = e::LwPolyline::new();
+            entity.vertices = polyline
+                .vertices
+                .iter()
+                .map(|vertex| {
+                    let mut lw =
+                        e::LwVertex::new(Vector2::new(vertex.position[0], vertex.position[1]));
+                    lw.bulge = vertex.bulge;
+                    lw
+                })
+                .collect();
+            entity.is_closed = polyline.closed;
+            entity.elevation = elevation;
+            entity.normal = vector3(normal);
+            EntityType::LwPolyline(entity)
+        }
+        _ => return None,
+    };
+    Some(entity)
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn curves_come_back_as_the_entities_they_were_read_from() {
+        use codec::entities as e;
+        let entities = [
+            EntityType::Line(e::Line::from_coords(1.0, 2.0, 3.0, 4.0, 6.0, 3.0)),
+            EntityType::Circle(e::Circle::from_coords(1.0, 1.0, 2.0, 5.0)),
+            EntityType::Arc(e::Arc::from_coords(0.0, 0.0, 0.0, 2.0, 0.5, 2.0)),
+            EntityType::LwPolyline(e::LwPolyline::from_points(vec![
+                codec::types::Vector2::new(0.0, 0.0),
+                codec::types::Vector2::new(4.0, 0.0),
+                codec::types::Vector2::new(4.0, 3.0),
+            ])),
+        ];
+        for entity in entities {
+            let curve = entity_curve(&entity).unwrap();
+            let back = curve_entity(&curve).unwrap();
+            assert_eq!(
+                std::mem::discriminant(&back),
+                std::mem::discriminant(&entity)
+            );
+            let again = entity_curve(&back).unwrap();
+            assert!((again.length() - curve.length()).abs() < 1e-9);
+            assert_eq!(again.point_at(0.3), curve.point_at(0.3));
+        }
+    }
+
     use super::*;
     use codec::entities::lwpolyline::LwVertex;
     use codec::entities::{Line as LineEnt, Ray as RayEnt, XLine as XLineEnt};

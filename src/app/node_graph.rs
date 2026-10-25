@@ -69,6 +69,13 @@ impl OpenCADStudio {
     /// first entity. With several entities the values shown are the lists.
     fn graph_object_sections(&self, i: usize, id: NodeId) -> Vec<NodeSection> {
         let graph = &self.tabs[i].graph;
+        if graph
+            .engine
+            .node(id)
+            .is_some_and(|node| is_draw(&node.kind))
+        {
+            return self.graph_draw_sections(i, id);
+        }
         let Some(&first) = graph.ui.get(&id).and_then(|ui| ui.handles.first()) else {
             return Vec::new();
         };
@@ -82,6 +89,41 @@ impl OpenCADStudio {
         graph_rows(panel, json!({ "handle": first.value() }), value)
     }
 
+    /// A Draw node's rows: what it draws and how, and the entities it drew.
+    fn graph_draw_sections(&self, i: usize, id: NodeId) -> Vec<NodeSection> {
+        let graph = &self.tabs[i].graph;
+        let outputs = graph.engine.node(id).map(|node| &node.outputs);
+        let first = graph.ui.get(&id).and_then(|ui| ui.handles.first().copied());
+        let value = |field: &str| {
+            outputs
+                .and_then(|outputs| outputs.get(field))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        let row = |field: &str, label: &str, input: bool| NodeRow {
+            field: field.to_owned(),
+            label: crate::t!(label).into_owned(),
+            value: match (field, first) {
+                ("object", Some(handle)) if value(field).is_null() => {
+                    json!({ "handle": handle.value() })
+                }
+                _ => value(field),
+            },
+            input,
+            output: true,
+            widget: RowWidget::Field,
+        };
+        vec![NodeSection {
+            title: String::new(),
+            rows: vec![
+                row("object", "Object", false),
+                row("geometry", "Geometry", true),
+                row("layer", "Layer", true),
+                row("color", "Color", true),
+            ],
+        }]
+    }
+
     /// The ports of an object node of `kind`, with the value kinds the
     /// Properties panel gives its rows, for automation clients.
     pub(super) fn graph_kind_ports(
@@ -90,6 +132,22 @@ impl OpenCADStudio {
         kind: ObjectKind,
     ) -> Vec<crate::app::graph_ops::Field> {
         use crate::app::graph_ops::{property_kind, Field};
+        use crate::ui::node_graph::Expect;
+        if kind == ObjectKind::Draw {
+            let field = |name: &str, label: &str, input: bool, kind: Expect| Field {
+                name: name.to_owned(),
+                label: crate::t!(label).into_owned(),
+                input,
+                output: true,
+                kind,
+            };
+            return vec![
+                field("object", "Object", false, Expect::Object),
+                field("geometry", "Geometry", true, Expect::Curve),
+                field("layer", "Layer", true, Expect::Text),
+                field("color", "Color", true, Expect::Any),
+            ];
+        }
         let panel = self.graph_entity_sections(i, Handle::NULL, &kind.entity());
         let object = Field {
             name: "object".to_owned(),
@@ -228,7 +286,118 @@ impl OpenCADStudio {
         tasks.append(&mut host.tasks);
         self.tabs[i].graph.engine = engine;
         self.graph_undo_open = false;
+        self.graph_refresh_preview();
         Task::batch(tasks)
+    }
+
+    /// Shows the curves the active graph computes as a viewport overlay
+    /// while the graph is open and its preview on; clears it elsewhere.
+    pub(super) fn graph_refresh_preview(&mut self) {
+        let (shown, active) = (self.show_node_graph, self.active_tab);
+        for (k, tab) in self.tabs.iter_mut().enumerate() {
+            tab.scene.graph_preview_wires = if shown && k == active && !tab.graph.preview_hidden {
+                preview_wires(&tab.graph)
+            } else {
+                Vec::new()
+            };
+        }
+    }
+
+    /// Draws a Draw node's curve values: one entity per curve, reusing the
+    /// node's entities of the same kind, on the given layer and colour (the
+    /// current layer and ByLayer when unset). Curves no entity can hold are
+    /// skipped; entities left over are erased.
+    fn graph_draw(
+        &mut self,
+        i: usize,
+        node: NodeId,
+        instances: &[Vec<(String, Value)>],
+    ) -> Vec<Vec<(String, Value)>> {
+        let mut spare: Vec<Handle> = self.tabs[i]
+            .graph
+            .ui
+            .get(&node)
+            .map(|ui| ui.handles.clone())
+            .unwrap_or_default();
+        spare.retain(|handle| self.tabs[i].scene.document.get_entity(*handle).is_some());
+        let mut drawn = Vec::new();
+        let mut results = Vec::new();
+        for fields in instances {
+            let get = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value.clone())
+            };
+            let geometry = get("geometry").unwrap_or(Value::Null);
+            let Some(mut entity) = graph::value::curve(&geometry)
+                .as_ref()
+                .and_then(crate::entities::curve::curve_entity)
+            else {
+                continue;
+            };
+            let document = &self.tabs[i].scene.document;
+            let layer = get("layer")
+                .map(|value| graph::value::text(&value).trim().to_owned())
+                .filter(|name| document.layers.get(name).is_some())
+                .unwrap_or_else(|| self.tabs[i].active_layer.clone());
+            let color = match get("color") {
+                Some(Value::Number(index)) => index
+                    .as_i64()
+                    .map_or(codec::types::Color::ByLayer, |index| {
+                        codec::types::Color::from_index(index as i16)
+                    }),
+                _ => codec::types::Color::ByLayer,
+            };
+            let reuse = spare.iter().position(|handle| {
+                document.get_entity(*handle).is_some_and(|existing| {
+                    std::mem::discriminant(existing) == std::mem::discriminant(&entity)
+                })
+            });
+            let handle = match reuse {
+                Some(k) => {
+                    let handle = spare.remove(k);
+                    if let Some(existing) = self.tabs[i].scene.document.get_entity(handle) {
+                        *entity.common_mut() = existing.common().clone();
+                    }
+                    entity.common_mut().layer = layer.clone();
+                    entity.common_mut().color = color;
+                    self.tabs[i].scene.update_entity(entity);
+                    handle
+                }
+                None => {
+                    entity.common_mut().handle = Handle::NULL;
+                    entity.common_mut().layer = layer.clone();
+                    entity.common_mut().color = color;
+                    let Some(handle) = self.commit_entity_handle_preserve_style(entity) else {
+                        continue;
+                    };
+                    handle
+                }
+            };
+            self.tabs[i].dirty = true;
+            drawn.push(handle);
+            results.push(vec![
+                ("geometry".to_owned(), geometry),
+                ("layer".to_owned(), json!(layer)),
+                (
+                    "color".to_owned(),
+                    match color {
+                        codec::types::Color::Index(index) => json!(index),
+                        _ => json!("ByLayer"),
+                    },
+                ),
+                ("object".to_owned(), json!({ "handle": handle.value() })),
+            ]);
+        }
+        if !spare.is_empty() {
+            self.tabs[i].scene.erase_entities(&spare);
+            self.tabs[i].dirty = true;
+        }
+        if let Some(ui) = self.tabs[i].graph.ui.get_mut(&node) {
+            ui.handles = drawn;
+        }
+        results
     }
 
     fn graph_run(&mut self, i: usize) -> Task<Message> {
@@ -250,7 +419,9 @@ impl OpenCADStudio {
                     self.dock_open_at_default(id);
                     return self.graph_run(i);
                 }
+                self.graph_refresh_preview();
             }
+            GraphMsg::TogglePreview => self.graph_refresh_preview(),
             GraphMsg::Add(item) => {
                 self.tabs[i].graph.record();
                 self.tabs[i].graph.add_node(item, Vec::new());
@@ -552,6 +723,9 @@ impl graph::Host for AppHost<'_> {
         let Some(kind) = ObjectKind::from_name(kind) else {
             return Vec::new();
         };
+        if kind == ObjectKind::Draw {
+            return app.graph_draw(i, node, instances);
+        }
         let mut handles: Vec<Handle> = app.tabs[i]
             .graph
             .ui
@@ -614,4 +788,50 @@ impl graph::Host for AppHost<'_> {
     fn expression(&self, text: &str) -> Option<f64> {
         crate::app::expr_eval::eval_number(text)
     }
+}
+
+/// Whether `kind` is the Draw Geometry node.
+fn is_draw(kind: &Kind) -> bool {
+    matches!(kind, Kind::Object(name) if name == ObjectKind::Draw.name())
+}
+
+/// Accent of the graph's curve preview.
+const PREVIEW_COLOR: [f32; 4] = [1.0, 0.55, 0.1, 0.9];
+
+/// The curves operation nodes compute, as overlay wires. Drawn objects show
+/// themselves; unbounded curves (rays, construction lines) are left out.
+fn preview_wires(graph: &crate::ui::node_graph::Graph) -> Vec<crate::scene::WireModel> {
+    fn walk(value: &Value, curves: &mut Vec<kernel::space::PlanarCurve>) {
+        match value {
+            Value::Array(items) => items.iter().for_each(|item| walk(item, curves)),
+            Value::Object(_) => curves.extend(graph::value::curve(value)),
+            _ => {}
+        }
+    }
+    let mut wires = Vec::new();
+    for node in &graph.engine.nodes {
+        if !matches!(node.kind, Kind::Op(_)) {
+            continue;
+        }
+        let mut curves = Vec::new();
+        node.outputs
+            .values()
+            .for_each(|value| walk(value, &mut curves));
+        for (k, curve) in curves.into_iter().enumerate() {
+            if curve.curve.extent() != kernel::geom2d::Extent::Bounded {
+                continue;
+            }
+            let tolerance = (curve.length() * 1e-3).max(1e-6);
+            let points = curve.tessellate_within(tolerance);
+            if points.len() >= 2 {
+                wires.push(crate::scene::WireModel::solid_f64(
+                    format!("graph-preview-{}-{k}", node.id),
+                    points,
+                    PREVIEW_COLOR,
+                    false,
+                ));
+            }
+        }
+    }
+    wires
 }

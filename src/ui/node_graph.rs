@@ -73,6 +73,9 @@ pub enum ObjectKind {
     XLine,
     Text,
     MText,
+    /// Draws curve values the graph computes: the one object node whose
+    /// entity kind follows its input.
+    Draw,
 }
 
 const OBJECTS: &[ObjectKind] = &[
@@ -86,6 +89,7 @@ const OBJECTS: &[ObjectKind] = &[
     ObjectKind::XLine,
     ObjectKind::Text,
     ObjectKind::MText,
+    ObjectKind::Draw,
 ];
 
 impl ObjectKind {
@@ -105,6 +109,7 @@ impl ObjectKind {
             ObjectKind::XLine => "Construction Line",
             ObjectKind::Text => "Text",
             ObjectKind::MText => "Multiline Text",
+            ObjectKind::Draw => "Draw Geometry",
         }
     }
 
@@ -131,6 +136,15 @@ impl ObjectKind {
                 | (ObjectKind::XLine, EntityType::XLine(_))
                 | (ObjectKind::Text, EntityType::Text(_))
                 | (ObjectKind::MText, EntityType::MText(_))
+                | (
+                    ObjectKind::Draw,
+                    EntityType::Line(_)
+                        | EntityType::Circle(_)
+                        | EntityType::Arc(_)
+                        | EntityType::LwPolyline(_)
+                        | EntityType::Ray(_)
+                        | EntityType::XLine(_)
+                )
         )
     }
 
@@ -146,6 +160,7 @@ impl ObjectKind {
             ObjectKind::XLine => "XLINE",
             ObjectKind::Text => "TEXT",
             ObjectKind::MText => "MTEXT",
+            ObjectKind::Draw => "",
         }
     }
 
@@ -187,6 +202,10 @@ impl ObjectKind {
             ObjectKind::MText => EntityType::MText(Box::new(
                 e::MText::with_value("MText", origin).with_height(2.5),
             )),
+            // A Draw node's entities come from its geometry input.
+            ObjectKind::Draw => {
+                EntityType::Line(e::Line::from_coords(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            }
         }
     }
 }
@@ -301,6 +320,8 @@ pub(crate) enum Expect {
     Bool,
     Point,
     Object,
+    /// A curve value or a drawn object: anything a curve node reads.
+    Curve,
 }
 
 impl Expect {
@@ -310,6 +331,7 @@ impl Expect {
             Value::String(_) => Expect::Text,
             Value::Bool(_) => Expect::Bool,
             Value::Object(object) if object.contains_key("handle") => Expect::Object,
+            Value::Object(object) if object.contains_key("curve") => Expect::Curve,
             Value::Object(_) if graph::value::point(value).is_some() => Expect::Point,
             _ => Expect::Any,
         }
@@ -332,6 +354,9 @@ impl Expect {
                 Expect::Bool => value.is_boolean(),
                 Expect::Point => graph::value::point(value).is_some(),
                 Expect::Object => value.get("handle").is_some(),
+                Expect::Curve => {
+                    value.get("handle").is_some() || graph::value::curve(value).is_some()
+                }
             },
         }
     }
@@ -345,6 +370,7 @@ impl Expect {
             Expect::Bool => "bool",
             Expect::Point => "point",
             Expect::Object => "object",
+            Expect::Curve => "curve",
         }
     }
 
@@ -355,6 +381,10 @@ impl Expect {
             || actual == Expect::Any
             || self == actual
             || (self == Expect::Text && matches!(actual, Expect::Number | Expect::Bool))
+            || matches!(
+                (self, actual),
+                (Expect::Curve, Expect::Object) | (Expect::Object, Expect::Curve)
+            )
     }
 
     fn label(self) -> Option<&'static str> {
@@ -365,6 +395,7 @@ impl Expect {
             Expect::Bool => Some("Expects true or false"),
             Expect::Point => Some("Expects a point"),
             Expect::Object => Some("Expects an object"),
+            Expect::Curve => Some("Expects a curve"),
         }
     }
 
@@ -374,7 +405,7 @@ impl Expect {
             Expect::Any | Expect::Number => Some("Number"),
             Expect::Text => Some("Text"),
             Expect::Bool => Some("Boolean"),
-            Expect::Point | Expect::Object => None,
+            Expect::Point | Expect::Object | Expect::Curve => None,
         }
     }
 }
@@ -416,6 +447,8 @@ pub struct Graph {
     /// Counts structural edits, so automation clients can tell when the
     /// graph they read has changed.
     pub revision: u64,
+    /// Hides the viewport preview of the curves nodes compute.
+    pub preview_hidden: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -467,6 +500,8 @@ pub enum GraphMsg {
     Zoom(i32),
     /// Shows or hides the node sequence, leaving only the Inputs area.
     ToggleSteps,
+    /// Shows or hides the viewport preview of computed curves.
+    TogglePreview,
     /// Adds an object node for each selected drawing entity, owning it as
     /// drawn.
     FromSelection,
@@ -501,9 +536,18 @@ pub fn display(value: &Value) -> String {
             let more = if items.len() > 4 { ", …" } else { "" };
             format!("[{}] {}{more}", items.len(), shown.join(", "))
         }
-        Value::Object(_) => match graph::value::point(value) {
-            Some(p) => format!("({}, {}, {})", number(p[0]), number(p[1]), number(p[2])),
-            None => value.to_string(),
+        Value::Object(_) => match (graph::value::point(value), graph::value::curve(value)) {
+            (Some(p), _) => format!("({}, {}, {})", number(p[0]), number(p[1]), number(p[2])),
+            (None, Some(curve)) => {
+                let kind = value["curve"].as_str().unwrap_or_default();
+                match curve.curve.extent() {
+                    kernel::geom2d::Extent::Bounded => {
+                        format!("{kind} · L {}", number(curve.length()))
+                    }
+                    _ => kind.to_owned(),
+                }
+            }
+            (None, None) => value.to_string(),
         },
         other => graph::value::text(other),
     }
@@ -691,6 +735,7 @@ impl Graph {
             "canvas": {
                 "zoom": self.zoom_steps,
                 "steps_hidden": self.steps_hidden,
+                "preview_hidden": self.preview_hidden,
                 "groups": groups,
                 "nodes": nodes,
             },
@@ -725,6 +770,7 @@ impl Graph {
             (steps as i32).clamp(*ZOOM_STEPS.start(), *ZOOM_STEPS.end())
         });
         graph.steps_hidden = canvas["steps_hidden"].as_bool().unwrap_or(false);
+        graph.preview_hidden = canvas["preview_hidden"].as_bool().unwrap_or(false);
         for group in canvas["groups"].as_array().into_iter().flatten() {
             let (Some(id), Some(name)) = (group["id"].as_u64(), group["name"].as_str()) else {
                 continue;
@@ -1265,7 +1311,7 @@ impl Graph {
                     graph::ops::Initial::Text(_) => Expect::Text,
                     graph::ops::Initial::Bool(_) => Expect::Bool,
                     graph::ops::Initial::None => match input.name {
-                        "curve" => Expect::Object,
+                        "curve" => Expect::Curve,
                         "point" | "center" => Expect::Point,
                         _ => Expect::Any,
                     },
@@ -1458,6 +1504,15 @@ impl Graph {
             )
             .gap(4),
             Space::new().width(10),
+            icon_button(
+                crate::ui::icons::PREVIEW,
+                if self.preview_hidden {
+                    "Show preview"
+                } else {
+                    "Hide preview"
+                },
+                Some(GraphMsg::TogglePreview)
+            ),
             icon_button(
                 crate::ui::icons::UNDO,
                 "Undo graph change",
@@ -2692,6 +2747,7 @@ impl Graph {
                 self.steps_hidden = !self.steps_hidden;
                 self.picking = None;
             }
+            GraphMsg::TogglePreview => self.preview_hidden = !self.preview_hidden,
             GraphMsg::GroupNew(id) => {
                 self.record();
                 self.new_group(*id);

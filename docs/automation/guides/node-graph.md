@@ -7,11 +7,13 @@ A drawing's node graph builds geometry from values. It has two areas:
 
 Object nodes (Line, Circle, Arc, Ellipse, Point, Polyline, Ray, Construction Line, Text, Multiline Text) own drawing entities; their ports are the entity's Properties rows. Computed rows such as Length, Angle or Delta X are outputs only. A list arriving at a step makes it run once per element, so an object node fed a list owns one entity per element.
 
+Curves are values too: `{"curve": "line" | "circle" | "arc" | "polyline" | "ray" | "xline", …}` in plane coordinates, angles in degrees. The Curve nodes (Line Curve, Circle Curve, Arc Curve, Polyline Curve, Offset Curve) make and change them without touching the drawing, and every geometry node takes either a curve value or a drawn object. Only a **Draw Geometry** node draws: it owns one entity per curve on its `geometry` input, on its `layer` (the current layer when unset or unknown) and `color` (an ACI index, ByLayer when unset), updating those entities in place as the curves change and erasing them when the curves go. While the graph is open, curves computed by operation nodes show in the viewport as a preview overlay that is never part of the drawing.
+
 Nodes have unique names (case-insensitive). Address a node by name or as `#id`, and a port as `"Node.port"`, split at the last dot, or as `{"node": "...", "port": "..."}`. A port may be named by its field (`end_x`) or its label (`End X`).
 
 ## Read
 
-- `ocs_read` `op: graph_library` lists every node type with `source` (`builtin` or `object`; `composite` and `script` are reserved), `category`, `area` (`inputs` or `sequence`) and its ports with `kind` (`number`, `text`, `bool`, `point`, `object` or `any`). Filter with `parameters.search` or pick one type with `parameters.name`.
+- `ocs_read` `op: graph_library` lists every node type with `source` (`builtin` or `object`; `composite` and `script` are reserved), `category`, `area` (`inputs` or `sequence`) and its ports with `kind` (`number`, `text`, `bool`, `point`, `curve`, `object` or `any`). Filter with `parameters.search` or pick one type with `parameters.name`.
 - `ocs_read` `op: graph_state` returns `graph_revision`, the `inputs` and `sequence` nodes in order, with their names, types, groups, entities and ports (value, kind, `computed`, and `source` when linked), and the groups. `parameters.detail: summary` leaves out the ports.
 - `ocs_read` `op: graph_validate` with `parameters.request` holding a `graph_apply` request applies it to a copy of the live graph and reports `valid`, per-change results, warnings and the links it would drop, without changing anything.
 
@@ -22,10 +24,18 @@ Nodes have unique names (case-insensitive). Address a node by name or as `#id`, 
 ```json
 {"op":"graph_apply","request_id":"wall-1","changes":[
   {"add":"Number","name":"Length","values":{"value":12}},
-  {"add":"Line","name":"Axis","group":"Wall"},
-  {"link":"Length.value","to":"Axis.end_x"},
-  {"add":"Line","name":"Face","after":"Axis","group":"Wall"},
-  {"link":"Axis.end_x","to":"Face.end_x"}
+  {"add":"Number","name":"Thickness","values":{"value":0.3}},
+  {"add":"Point","source":"builtin","name":"Start"},
+  {"add":"Point","source":"builtin","name":"End"},
+  {"link":"Length.value","to":"End.x"},
+  {"add":"Line Curve","name":"Axis","group":"Wall"},
+  {"link":"Start.point","to":"Axis.start"},
+  {"link":"End.point","to":"Axis.end"},
+  {"add":"Offset Curve","name":"Face","group":"Wall"},
+  {"link":"Axis.curve","to":"Face.curve"},
+  {"link":"Thickness.value","to":"Face.distance"},
+  {"add":"Draw Geometry","name":"Draw face","group":"Wall"},
+  {"link":"Face.curve","to":"Draw face.geometry"}
 ]}
 ```
 

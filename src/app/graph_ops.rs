@@ -194,7 +194,11 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
                         label: (*name).to_owned(),
                         input: false,
                         output: true,
-                        kind: Expect::Any,
+                        kind: if *name == "curve" {
+                            Expect::Curve
+                        } else {
+                            Expect::Any
+                        },
                     }),
             );
             fields
@@ -1455,5 +1459,129 @@ mod tests {
         let _ = app.on_graph(crate::ui::node_graph::GraphMsg::Undo);
         let state = read(&mut app, "graph_state", json!({}));
         assert_eq!(state["inputs"], json!([]));
+    }
+
+    fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {
+        let query = app.automation_op(&format!(
+            r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#
+        ));
+        query["count"].as_u64().unwrap_or(0) as usize
+    }
+
+    #[test]
+    fn curves_flow_as_values_and_only_the_draw_node_draws() {
+        let mut app = app();
+        let built = apply_changes(
+            &mut app,
+            "c1",
+            json!([
+                {"add": "Number", "name": "Length", "values": {"value": 10}},
+                {"add": "Number", "name": "Gap", "values": {"value": 2}},
+                {"add": "Point", "source": "builtin", "name": "Start"},
+                {"add": "Point", "source": "builtin", "name": "End"},
+                {"link": "Length.value", "to": "End.x"},
+                {"add": "Line Curve", "name": "Axis"},
+                {"link": "Start.point", "to": "Axis.start"},
+                {"link": "End.point", "to": "Axis.end"},
+                {"add": "Offset Curve", "name": "Face"},
+                {"link": "Axis.curve", "to": "Face.curve"},
+                {"link": "Gap.value", "to": "Face.distance"},
+                {"add": "Draw Geometry", "name": "Wall"},
+                {"link": "Face.curve", "to": "Wall.geometry"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        assert_eq!(
+            built["result"]["warnings"],
+            json!([]),
+            "no type warnings: {built}"
+        );
+        // Only the Draw node put anything in the drawing: one line.
+        assert_eq!(count_lines(&mut app, "Line"), 1);
+        let state = read(&mut app, "graph_state", json!({}));
+        let face = node(&state, "sequence", "Face");
+        let curve = face["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|port| port["name"] == "curve")
+            .unwrap();
+        assert_eq!(curve["kind"], "curve");
+        assert_eq!(curve["value"]["start"], json!([0.0, 2.0]));
+        let wall = node(&state, "sequence", "Wall");
+        let handle = wall["entities"][0].clone();
+
+        // A new value moves the same entity.
+        let set = apply_changes(
+            &mut app,
+            "c2",
+            json!([{"set": "Length.value", "value": 25}]),
+        );
+        assert_eq!(set["ok"], true, "{set}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(node(&state, "sequence", "Wall")["entities"][0], handle);
+        let query = app.automation_op(r#"{"op":"query","type":"Line","detail":"geometry"}"#);
+        assert_eq!(count_lines(&mut app, "Line"), 1);
+        let line = &query["entities"][0];
+        assert!(line.to_string().contains("25"), "{line}");
+
+        // The preview shows the computed curves while the graph is open.
+        app.show_node_graph = true;
+        app.graph_refresh_preview();
+        let i = app.active_tab;
+        assert_eq!(
+            app.tabs[i].scene.graph_preview_wires.len(),
+            2,
+            "axis and face"
+        );
+        app.show_node_graph = false;
+        app.graph_refresh_preview();
+        assert!(app.tabs[i].scene.graph_preview_wires.is_empty());
+
+        // Unlinking the geometry erases what the node drew.
+        let cut = apply_changes(&mut app, "c3", json!([{"unlink": "Wall.geometry"}]));
+        assert_eq!(cut["ok"], true, "{cut}");
+        assert_eq!(count_lines(&mut app, "Line"), 0);
+    }
+
+    #[test]
+    fn a_closed_polyline_offset_draws_a_polyline() {
+        let mut app = app();
+        let built = apply_changes(
+            &mut app,
+            "p1",
+            json!([
+                {"add": "Number", "name": "Size", "values": {"value": 10}},
+                {"add": "Point", "source": "builtin", "name": "A"},
+                {"add": "Point", "source": "builtin", "name": "B"},
+                {"add": "Point", "source": "builtin", "name": "C"},
+                {"link": "Size.value", "to": "B.x"},
+                {"link": "Size.value", "to": "C.x"},
+                {"link": "Size.value", "to": "C.y"},
+                {"add": "Create List", "name": "Corners"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let library = read(&mut app, "graph_library", json!({"name": "Create List"}));
+        let ports: Vec<String> = library["types"][0]["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|port| port["name"].as_str().unwrap().to_owned())
+            .collect();
+        let mut changes = vec![];
+        for (port, point) in ports.iter().zip(["A", "B", "C"]) {
+            changes
+                .push(json!({"link": format!("{point}.point"), "to": format!("Corners.{port}")}));
+        }
+        changes.extend([
+            json!({"add": "Polyline Curve", "name": "Outline"}),
+            json!({"link": "Corners.list", "to": "Outline.points"}),
+            json!({"add": "Draw Geometry", "name": "Drawn"}),
+            json!({"link": "Outline.curve", "to": "Drawn.geometry"}),
+        ]);
+        let drawn = apply_changes(&mut app, "p2", Value::Array(changes));
+        assert_eq!(drawn["ok"], true, "{drawn}");
+        assert_eq!(count_lines(&mut app, "LwPolyline"), 1, "{drawn}");
     }
 }

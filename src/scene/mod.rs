@@ -2472,6 +2472,9 @@ pub struct Scene {
     /// drawn separately so hovering one constraint does not light the whole chain.
     constraint_hover_refs: Vec<crate::scene::parametric_constraints::ParametricRef>,
     constraint_hover_wires: Vec<WireModel>,
+    /// The node graph's preview of the geometry its nodes compute without
+    /// drawing: an overlay like the command previews, never in the drawing.
+    pub graph_preview_wires: Vec<WireModel>,
     /// Color used to draw the selection highlight overlay wires (SELECTIONEFFECTCOLOR).
     pub selection_color: [f32; 4],
     /// Whether selection visual effect (glow/highlight) is enabled (SELECTIONEFFECT).
@@ -3122,6 +3125,7 @@ impl Scene {
             constraint_hover_highlights: HashSet::default(),
             constraint_hover_refs: Vec::new(),
             constraint_hover_wires: Vec::new(),
+            graph_preview_wires: Vec::new(),
             selection_color: crate::scene::model::wire_model::WireModel::SELECTED,
             selection_widen: 0.0,
             selection_effect: true,
