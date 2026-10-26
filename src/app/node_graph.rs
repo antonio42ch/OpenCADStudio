@@ -7,6 +7,7 @@ use super::{Message, OpenCADStudio};
 use crate::scene::model::object::PropSection;
 use crate::ui::node_graph::{GraphMsg, NodeRow, NodeSection, ObjectKind, RowWidget};
 use codec::Handle;
+use graph::docs::{PortType, Type};
 use graph::{Kind, NodeId, Port};
 use iced::Task;
 use rustc_hash::FxHashMap as HashMap;
@@ -100,7 +101,7 @@ impl OpenCADStudio {
                 .cloned()
                 .unwrap_or(Value::Null)
         };
-        let row = |field: &str, label: &str, input: bool| NodeRow {
+        let row = |field: &str, label: &str, input: bool, kind: Type, list: bool| NodeRow {
             field: field.to_owned(),
             label: crate::t!(label).into_owned(),
             value: match (field, first) {
@@ -112,14 +113,15 @@ impl OpenCADStudio {
             input,
             output: true,
             widget: RowWidget::Field,
+            kind: Some(PortType { kind, list }),
         };
         vec![NodeSection {
             title: String::new(),
             rows: vec![
-                row("object", "Object", false),
-                row("geometry", "Geometry", true),
-                row("layer", "Layer", true),
-                row("color", "Color", true),
+                row("object", "Object", false, Type::Object, false),
+                row("geometry", "Geometry", true, Type::Curve, true),
+                row("layer", "Layer", true, Type::Text, false),
+                row("color", "Color", true, Type::Number, false),
             ],
         }]
     }
@@ -195,6 +197,10 @@ fn graph_rows(
         input: false,
         output: true,
         widget: RowWidget::Field,
+        kind: Some(PortType {
+            kind: Type::Object,
+            list: false,
+        }),
     };
     std::iter::once(NodeSection {
         title: String::new(),
@@ -208,11 +214,17 @@ fn graph_rows(
                 .iter()
                 .map(|property| {
                     let json = crate::app::control::property_json(property);
+                    let kind = json["kind"].as_str().unwrap_or_default();
                     NodeRow {
                         field: property.field.to_owned(),
                         label: property.label.clone(),
-                        input: !matches!(json["kind"].as_str(), Some("readonly" | "specialized")),
+                        input: !matches!(kind, "readonly" | "specialized"),
                         output: true,
+                        kind: Some(PortType {
+                            kind: crate::app::graph_ops::property_kind(kind, &json["value"])
+                                .port_kind(),
+                            list: false,
+                        }),
                         value: value(property.field, json["value"].clone()),
                         widget: RowWidget::Field,
                     }

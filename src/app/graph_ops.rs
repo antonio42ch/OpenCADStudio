@@ -199,7 +199,8 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
                         label: (*name).to_owned(),
                         input: false,
                         output: true,
-                        kind: output_kind(name),
+                        kind: graph::docs::output_type(spec, name)
+                            .map_or(Expect::Any, Expect::of_type),
                     }),
             );
             fields
@@ -220,26 +221,15 @@ pub(crate) fn composite_ports(composite: &graph::Composite) -> Vec<Field> {
         output: false,
         kind: crate::ui::node_graph::composite_expect(composite, name),
     });
-    let outputs = composite.outputs.iter().map(|(name, port)| Field {
+    let outputs = composite.outputs.iter().map(|(name, _)| Field {
         name: name.clone(),
         label: name.clone(),
         input: false,
         output: true,
-        kind: output_kind(&port.field),
+        kind: crate::ui::node_graph::composite_type(composite, name, false)
+            .map_or(Expect::Any, Expect::of_type),
     });
     inputs.chain(outputs).collect()
-}
-
-/// The kind an operation output holds, by its name.
-fn output_kind(name: &str) -> Expect {
-    match name {
-        "curve" | "curves" => Expect::Curve,
-        "point" | "vector" | "origin" | "x_axis" | "y_axis" | "normal" | "start" | "end" => {
-            Expect::Point
-        }
-        "plane" => Expect::Plane,
-        _ => Expect::Any,
-    }
 }
 
 fn resolve_node(graph: &Graph, reference: &Value) -> Result<NodeId, ChangeError> {
@@ -1066,6 +1056,7 @@ impl OpenCADStudio {
                 "type": kind.name(),
                 "source": "object",
                 "category": "Objects",
+                "description": kind.description(),
                 "area": "sequence",
                 "inputs": fields.iter().filter(|field| field.input).map(port).collect::<Vec<_>>(),
                 "outputs": fields.iter().filter(|field| field.output).map(|field| {
@@ -1104,6 +1095,7 @@ impl OpenCADStudio {
                 "type": spec.name,
                 "source": "builtin",
                 "category": spec.category,
+                "description": graph::docs::doc(spec).map(|doc| doc.description),
                 "area": if is_input(&Kind::Op(spec)) { "inputs" } else { "sequence" },
                 "inputs": inputs,
                 "outputs": fields.iter().filter(|field| field.output).map(port).collect::<Vec<_>>(),
@@ -1416,11 +1408,23 @@ mod tests {
         assert_eq!(add["source"], "builtin");
         assert_eq!(add["area"], "sequence");
         assert_eq!(add["inputs"][0]["kind"], "number");
+        assert_eq!(add["description"], "a + b.");
+        // Kinds come from the library's documentation, not from port names.
+        let between = types
+            .iter()
+            .find(|ty| ty["type"] == "Vector Between")
+            .unwrap();
+        assert_eq!(between["inputs"][0]["kind"], "point");
+        let orient = types.iter().find(|ty| ty["type"] == "Orient").unwrap();
+        assert_eq!(orient["inputs"][1]["kind"], "plane");
         let number = types.iter().find(|ty| ty["type"] == "Number").unwrap();
         assert_eq!(number["area"], "inputs");
         let line = types.iter().find(|ty| ty["type"] == "Line").unwrap();
         assert_eq!(line["source"], "object");
         assert!(!line["inputs"].as_array().unwrap().is_empty());
+        assert!(line["description"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Draws a line")));
         assert!(line["outputs"]
             .as_array()
             .unwrap()
@@ -1598,6 +1602,105 @@ mod tests {
             r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#
         ));
         query["count"].as_u64().unwrap_or(0) as usize
+    }
+
+    /// Stations along an alignment from generic nodes only: a list of
+    /// distances, a frame at each, a tick across the axis and a label.
+    #[test]
+    fn stations_label_and_tick_an_alignment() {
+        let mut app = app();
+        let built = apply_changes(
+            &mut app,
+            "s1",
+            json!([
+                {"add": "Number", "name": "Interval", "values": {"value": 30}},
+                {"add": "Number", "name": "Tick", "values": {"value": 2}},
+                {"add": "Boolean", "name": "To the end", "values": {"value": true}},
+                {"add": "Point", "source": "builtin", "name": "A"},
+                {"add": "Point", "source": "builtin", "name": "B"},
+                {"add": "Point", "source": "builtin", "name": "C"},
+                {"add": "Number", "name": "Bx", "values": {"value": 100}},
+                {"add": "Number", "name": "Cx", "values": {"value": 160}},
+                {"add": "Number", "name": "Cy", "values": {"value": 80}},
+                {"link": "Bx.value", "to": "B.x"},
+                {"link": "Cx.value", "to": "C.x"},
+                {"link": "Cy.value", "to": "C.y"},
+                {"add": "Create List", "name": "Vertices"},
+                {"link": "A.point", "to": "Vertices.item 0"},
+                {"link": "B.point", "to": "Vertices.item 1"},
+                {"link": "C.point", "to": "Vertices.item 2"},
+                {"add": "Polyline Curve", "name": "Axis"},
+                {"link": "Vertices.list", "to": "Axis.points"},
+                {"add": "Curve Length", "name": "Length"},
+                {"link": "Axis.curve", "to": "Length.curve"},
+                {"add": "Range", "name": "Stations"},
+                {"link": "Length.result", "to": "Stations.end"},
+                {"link": "Interval.value", "to": "Stations.step"},
+                {"link": "To the end.value", "to": "Stations.include end"},
+                {"add": "Frame At Distance", "name": "Frames"},
+                {"link": "Axis.curve", "to": "Frames.curve"},
+                {"link": "Stations.list", "to": "Frames.distance"},
+                {"add": "Line By Direction", "name": "Half tick"},
+                {"link": "Frames.point", "to": "Half tick.start"},
+                {"link": "Frames.perpendicular", "to": "Half tick.direction"},
+                {"link": "Tick.value", "to": "Half tick.length"},
+                {"add": "Extend Curve", "name": "Ticks"},
+                {"link": "Half tick.curve", "to": "Ticks.curve"},
+                {"link": "Tick.value", "to": "Ticks.start"},
+                {"add": "Draw Geometry", "name": "Draw ticks"},
+                {"link": "Ticks.curve", "to": "Draw ticks.geometry"},
+                {"add": "Format Number", "name": "Label"},
+                {"link": "Stations.list", "to": "Label.value"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        assert_eq!(built["result"]["warnings"], json!([]), "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        let port = |node_name: &str, port: &str| {
+            node(&state, "sequence", node_name)["ports"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["name"] == port)
+                .unwrap_or_else(|| panic!("{node_name}.{port}"))["value"]
+                .clone()
+        };
+        // 200 long in steps of 30: the end closes the list.
+        let stations = port("Stations", "list");
+        assert_eq!(stations.as_array().unwrap().len(), 8, "{stations}");
+        assert_eq!(stations[7], json!(200.0));
+        let angles = port("Frames", "angle");
+        assert!((angles[0].as_f64().unwrap()).abs() < 1e-9);
+        assert!(
+            (angles[7].as_f64().unwrap() - 53.130_102).abs() < 1e-5,
+            "{angles}"
+        );
+        assert_eq!(count_lines(&mut app, "Line"), 8);
+
+        // The label as a station, set on the inputs area.
+        let formatted = apply_changes(
+            &mut app,
+            "s2",
+            json!([
+                {"add": "Number", "name": "Digits", "values": {"value": 4}},
+                {"add": "Number", "name": "Group", "values": {"value": 3}},
+                {"add": "Text", "source": "builtin", "name": "Plus", "values": {"value": "+"}},
+                {"link": "Digits.value", "to": "Label.digits"},
+                {"link": "Group.value", "to": "Label.group size"},
+                {"link": "Plus.value", "to": "Label.separator"},
+            ]),
+        );
+        assert_eq!(formatted["ok"], true, "{formatted}");
+        let state = read(&mut app, "graph_state", json!({}));
+        let labels = node(&state, "sequence", "Label")["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == "result")
+            .unwrap()["value"]
+            .clone();
+        assert_eq!(labels[1], json!("0+030.00"));
+        assert_eq!(labels[7], json!("0+200.00"));
     }
 
     #[test]

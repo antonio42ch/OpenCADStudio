@@ -14,6 +14,7 @@
 use codec::{EntityType, Handle};
 use std::sync::Arc;
 
+use graph::docs::{PortType, Type};
 use graph::{Composite, Kind, Link, NodeId, Port, Spec};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
@@ -112,6 +113,23 @@ impl ObjectKind {
             ObjectKind::Text => "Text",
             ObjectKind::MText => "Multiline Text",
             ObjectKind::Draw => "Draw Geometry",
+        }
+    }
+
+    /// What the node does, for its tooltip.
+    pub fn description(self) -> &'static str {
+        match self {
+            ObjectKind::Line => "Draws a line and keeps it in step with its inputs. Its rows are the line's properties.",
+            ObjectKind::Circle => "Draws a circle and keeps it in step with its inputs. Its rows are the circle's properties.",
+            ObjectKind::Arc => "Draws an arc and keeps it in step with its inputs. Its rows are the arc's properties.",
+            ObjectKind::Ellipse => "Draws an ellipse and keeps it in step with its inputs. Its rows are the ellipse's properties.",
+            ObjectKind::Point => "Draws a point object and keeps it in step with its inputs.",
+            ObjectKind::Polyline => "Draws a polyline and keeps it in step with its inputs. Its rows are the polyline's properties.",
+            ObjectKind::Ray => "Draws a ray, a line endless in one direction.",
+            ObjectKind::XLine => "Draws a construction line, endless in both directions.",
+            ObjectKind::Text => "Draws a single-line text: contents, position, height and rotation can all come from other nodes.",
+            ObjectKind::MText => "Draws a multiline text and keeps it in step with its inputs.",
+            ObjectKind::Draw => "Draws every curve it receives, on a layer and in a colour, and keeps the drawing in step with them.",
         }
     }
 
@@ -331,36 +349,159 @@ pub fn forget_library_entry(k: usize) {
 
 /// What a composite input accepts: what the inner input it stands for does.
 pub(crate) fn composite_expect(composite: &Composite, name: &str) -> Expect {
-    let Some((_, port)) = composite.inputs.iter().find(|(input, _)| input == name) else {
-        return Expect::Any;
-    };
-    match composite.graph.node(port.node).map(|node| &node.kind) {
-        Some(Kind::Op(spec)) => spec_expect(spec, &port.field),
-        Some(Kind::Composite(inner)) => composite_expect(inner, &port.field),
-        _ => Expect::Any,
+    composite_type(composite, name, true).map_or(Expect::Any, Expect::of_type)
+}
+
+/// What input `field` of an operation accepts, as the library documents it.
+pub(crate) fn spec_expect(spec: &Spec, field: &str) -> Expect {
+    graph::docs::input_type(spec, field).map_or(Expect::Any, Expect::of_type)
+}
+
+/// The kind of value port `field` of a node of `kind` holds, an input when
+/// `input`: an operation's from the library, a composite's from the step
+/// inside it the port leads to. Object nodes' rows come from the drawing.
+pub(crate) fn port_type(kind: &Kind, field: &str, input: bool) -> Option<PortType> {
+    match kind {
+        Kind::Op(spec) if input => graph::docs::input_type(spec, field),
+        Kind::Op(spec) => graph::docs::output_type(spec, field),
+        Kind::Composite(composite) => composite_type(composite, field, input),
+        Kind::Object(_) => None,
     }
 }
 
-/// What input `field` of an operation accepts, from its default and name.
-pub(crate) fn spec_expect(spec: &Spec, field: &str) -> Expect {
-    let Some(input) = spec.inputs.iter().find(|input| input.name == field) else {
-        return Expect::Any;
+pub(crate) fn composite_type(composite: &Composite, field: &str, input: bool) -> Option<PortType> {
+    let ports = if input {
+        &composite.inputs
+    } else {
+        &composite.outputs
     };
-    if input.list {
-        return Expect::Any;
+    let (_, port) = ports.iter().find(|(name, _)| name == field)?;
+    port_type(&composite.graph.node(port.node)?.kind, &port.field, input)
+}
+
+/// What a node does, for its tooltip.
+pub(crate) fn describe(kind: &Kind) -> String {
+    match kind {
+        Kind::Op(spec) => graph::docs::doc(spec)
+            .map(|doc| t!(doc.description).into_owned())
+            .unwrap_or_default(),
+        Kind::Object(name) => ObjectKind::from_name(name)
+            .map(|kind| t!(kind.description()).into_owned())
+            .unwrap_or_default(),
+        Kind::Composite(composite) => crate::tf!(
+            "A composite of {} steps used as one node. Expand it to see or change them.",
+            composite.graph.nodes.len()
+        )
+        .into_owned(),
     }
-    match input.default {
-        graph::ops::Initial::Num(_) => Expect::Number,
-        graph::ops::Initial::Text(_) => Expect::Text,
-        graph::ops::Initial::Bool(_) => Expect::Bool,
-        graph::ops::Initial::None => match input.name {
-            "curve" => Expect::Curve,
-            "point" | "center" | "vector" | "origin" | "x_axis" | "y_axis" | "start" | "end"
-            | "direction" | "corner" | "from_point" => Expect::Point,
-            "plane" | "from" | "to" => Expect::Plane,
-            _ => Expect::Any,
-        },
+}
+
+/// The kind a row holds: the declared one, or for a row of any kind the one
+/// its value has.
+fn shown_type(kind: Option<PortType>, value: &Value) -> PortType {
+    match kind {
+        Some(kind) if kind.kind != Type::Any => kind,
+        _ => {
+            let list = kind.is_some_and(|kind| kind.list) || value.is_array();
+            let item = match value {
+                Value::Array(items) => items.iter().find(|item| !item.is_null()),
+                Value::Null => None,
+                other => Some(other),
+            };
+            PortType {
+                kind: item.map_or(Type::Any, |item| Expect::of_value(item).port_kind()),
+                list,
+            }
+        }
     }
+}
+
+/// The name a card shows for a kind of value.
+fn type_label(kind: Type) -> &'static str {
+    match kind {
+        Type::Any => "any",
+        Type::Number => "number",
+        Type::Text => "text",
+        Type::Bool => "true/false",
+        Type::Point => "point",
+        Type::Vector => "vector",
+        Type::Curve => "curve",
+        Type::Plane => "plane",
+        Type::Geometry => "geometry",
+        Type::Object => "object",
+    }
+}
+
+fn type_color(kind: Type) -> Color {
+    match kind {
+        Type::Any => Color::from_rgb8(0x94, 0xA3, 0xB8),
+        Type::Number => Color::from_rgb8(0x3B, 0x82, 0xF6),
+        Type::Text => Color::from_rgb8(0x10, 0xB9, 0x81),
+        Type::Bool => Color::from_rgb8(0xF5, 0x9E, 0x0B),
+        Type::Point => Color::from_rgb8(0x8B, 0x5C, 0xF6),
+        Type::Vector => Color::from_rgb8(0x06, 0xB6, 0xD4),
+        Type::Curve => Color::from_rgb8(0xF9, 0x73, 0x16),
+        Type::Plane => Color::from_rgb8(0xEC, 0x48, 0x99),
+        Type::Geometry => Color::from_rgb8(0x84, 0xCC, 0x16),
+        Type::Object => Color::from_rgb8(0xEF, 0x44, 0x44),
+    }
+}
+
+/// A small tag naming the kind of value a row holds; a list shows in
+/// brackets.
+fn type_chip<'a>(kind: PortType) -> Element<'a, Message> {
+    let color = type_color(kind.kind);
+    let name = t!(type_label(kind.kind)).into_owned();
+    let label = if kind.list { format!("[{name}]") } else { name };
+    container(text(label).size(9))
+        .padding([0, 4])
+        .style(move |theme: &Theme| container::Style {
+            background: Some(Background::Color(color.scale_alpha(0.18))),
+            text_color: Some(theme.palette().background.base.text),
+            border: Border {
+                color: color.scale_alpha(0.7),
+                width: 1.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+}
+
+/// An operation's port kinds, `inputs → outputs`.
+fn signature(spec: &Spec) -> Option<String> {
+    let doc = graph::docs::doc(spec)?;
+    let names = |ports: &[PortType]| {
+        ports
+            .iter()
+            .map(|port| {
+                let name = t!(type_label(port.kind)).into_owned();
+                if port.list {
+                    format!("[{name}]")
+                } else {
+                    name
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(format!("{} → {}", names(&doc.inputs), names(&doc.outputs)))
+}
+
+/// A tooltip box holding a paragraph.
+fn tip_box<'a>(content: String) -> Element<'a, Message> {
+    // Containers take no maximum width: a long paragraph gets a fixed one
+    // to wrap in, a short one keeps its own.
+    let width = if content.chars().count() > 48 {
+        Length::Fixed(280.0)
+    } else {
+        Length::Shrink
+    };
+    container(text(content).size(10))
+        .padding([4, 8])
+        .width(width)
+        .style(container::bordered_box)
+        .into()
 }
 
 pub type GroupId = u32;
@@ -409,6 +550,8 @@ pub struct NodeRow {
     pub input: bool,
     pub output: bool,
     pub widget: RowWidget,
+    /// The kind of value the row holds, when known ahead of its value.
+    pub kind: Option<PortType>,
 }
 
 /// What a rename is renaming.
@@ -513,6 +656,34 @@ impl Expect {
             Expect::Object => "object",
             Expect::Curve => "curve",
             Expect::Plane => "plane",
+        }
+    }
+
+    /// The check for a documented port kind: a list port checks its items.
+    pub(crate) fn of_type(kind: PortType) -> Self {
+        match kind.kind {
+            Type::Any | Type::Geometry => Expect::Any,
+            Type::Number => Expect::Number,
+            Type::Text => Expect::Text,
+            Type::Bool => Expect::Bool,
+            Type::Point | Type::Vector => Expect::Point,
+            Type::Curve => Expect::Curve,
+            Type::Plane => Expect::Plane,
+            Type::Object => Expect::Object,
+        }
+    }
+
+    /// The documented kind this check stands for.
+    pub(crate) fn port_kind(self) -> Type {
+        match self {
+            Expect::Any => Type::Any,
+            Expect::Number => Type::Number,
+            Expect::Text => Type::Text,
+            Expect::Bool => Type::Bool,
+            Expect::Point => Type::Point,
+            Expect::Object => Type::Object,
+            Expect::Curve => Type::Curve,
+            Expect::Plane => Type::Plane,
         }
     }
 
@@ -1573,6 +1744,7 @@ impl Graph {
                     input: true,
                     output,
                     widget,
+                    kind: graph::docs::input_type(spec, input.name),
                 }
             })
             .collect();
@@ -1587,6 +1759,7 @@ impl Graph {
                     input: false,
                     output: true,
                     widget: RowWidget::Field,
+                    kind: graph::docs::output_type(spec, name),
                 }),
         );
         vec![NodeSection {
@@ -1627,6 +1800,7 @@ impl Graph {
             input: true,
             output: false,
             widget: RowWidget::Field,
+            kind: port_type(&node.kind, name, true),
         });
         let outputs = composite.outputs.iter().map(|(name, _)| NodeRow {
             field: name.clone(),
@@ -1635,6 +1809,7 @@ impl Graph {
             input: false,
             output: true,
             widget: RowWidget::Field,
+            kind: port_type(&node.kind, name, false),
         });
         vec![NodeSection {
             title: String::new(),
@@ -2114,14 +2289,24 @@ impl Graph {
             .gap(4)
             .into(),
         };
-        let title = column![
-            name,
-            text(kind).size(10).style(|theme: &Theme| text::Style {
-                color: Some(theme.palette().primary.weak.text.scale_alpha(0.7)),
-            }),
-        ]
-        .spacing(1)
-        .width(Length::Fill);
+        let about = describe(&node.kind);
+        let kind = text(kind).size(10).style(|theme: &Theme| text::Style {
+            color: Some(theme.palette().primary.weak.text.scale_alpha(0.7)),
+        });
+        let kind: Element<'_, Message> = if about.is_empty() {
+            kind.into()
+        } else {
+            tooltip(
+                row![kind, crate::ui::icons::themed(crate::ui::icons::INFO, 9.0)]
+                    .spacing(3)
+                    .align_y(iced::Center),
+                tip_box(about),
+                tooltip::Position::Bottom,
+            )
+            .gap(4)
+            .into()
+        };
+        let title = column![name, kind].spacing(1).width(Length::Fill);
         let mut header = row![
             badge(node_color(id), step.map(|step| step.to_string())),
             title
@@ -2390,9 +2575,12 @@ impl Graph {
                 for node_row in computed {
                     body = body.push(
                         row![
-                            text(t!(node_row.label.as_str()).into_owned())
-                                .size(11)
-                                .width(LABEL_W),
+                            column![
+                                text(t!(node_row.label.as_str()).into_owned()).size(11),
+                                type_chip(shown_type(node_row.kind, &node_row.value)),
+                            ]
+                            .spacing(2)
+                            .width(LABEL_W),
                             text(display(&node_row.value))
                                 .size(11)
                                 .style(weak_text)
@@ -2427,9 +2615,12 @@ impl Graph {
             field: node_row.field,
         };
         let shown = display(&node_row.value);
-        let label = text(t!(node_row.label.as_str()).into_owned())
-            .size(11)
-            .width(LABEL_W);
+        let label = column![
+            text(t!(node_row.label.as_str()).into_owned()).size(11),
+            type_chip(shown_type(node_row.kind, &node_row.value)),
+        ]
+        .spacing(2)
+        .width(LABEL_W);
         let source = sources.get(&port).cloned();
         let picking = self.picking.as_ref() == Some(&port);
         let linked = source.is_some();
@@ -2525,6 +2716,7 @@ impl Graph {
             value: String,
             computed: bool,
             fits: bool,
+            kind: PortType,
         }
         struct Group {
             id: NodeId,
@@ -2564,6 +2756,7 @@ impl Graph {
                     value: display(&row.value),
                     computed: !row.input,
                     fits: expect.fits(&row.value),
+                    kind: shown_type(row.kind, &row.value),
                 })
                 .filter(|entry| {
                     query.is_empty() || name_match || entry.label.to_lowercase().contains(&query)
@@ -2624,7 +2817,7 @@ impl Graph {
             for entry in group.entries {
                 let chosen = current.as_ref() == Some(&entry.port);
                 let fits = entry.fits;
-                let mut label_row = row![text(entry.label).size(11)]
+                let mut label_row = row![text(entry.label).size(11), type_chip(entry.kind)]
                     .spacing(4)
                     .align_y(iced::Center);
                 if entry.computed {
@@ -2857,6 +3050,19 @@ impl Graph {
         .style(button::text)
         .padding([3, 10])
         .width(Length::Fill);
+        let mut about = item.kind().map(|kind| describe(&kind)).unwrap_or_default();
+        if let PaletteItem::Op(spec) = item {
+            if let Some(signature) = signature(spec) {
+                about = format!("{about}\n{signature}");
+            }
+        }
+        let entry: Element<'_, Message> = if about.is_empty() {
+            entry.into()
+        } else {
+            tooltip(entry, tip_box(about), tooltip::Position::Bottom)
+                .gap(2)
+                .into()
+        };
         match item {
             PaletteItem::Composite(k) => row![
                 entry,
@@ -2941,25 +3147,53 @@ impl Graph {
             // A search shows every match, collapsed categories included.
             let open = !query.is_empty()
                 || (category == "Objects") != self.toggled_categories.contains(category);
-            tree = tree.push(
-                button(
-                    row![
-                        crate::ui::icons::themed_arrow_toggle(open, 9.0),
-                        text(t!(category)).size(11)
-                    ]
-                    .spacing(4)
-                    .align_y(iced::Center),
-                )
+            // Objects are the nodes that draw; the other categories only
+            // compute values, so Objects stands out.
+            let draws = category == "Objects";
+            let mut heading = row![
+                crate::ui::icons::themed_arrow_toggle(open, 9.0),
+                text(t!(category)).size(11).width(Length::Fill)
+            ]
+            .spacing(4)
+            .align_y(iced::Center);
+            if draws {
+                heading = heading.push(text(t!("Draws in the drawing")).size(9));
+            }
+            let heading = button(heading)
                 .on_press(msg(GraphMsg::Category(category)))
-                .style(|theme: &Theme, status| {
+                .style(move |theme: &Theme, status| {
+                    let palette = theme.palette();
                     let mut style = button::text(theme, status);
-                    style.background =
-                        Some(Background::Color(theme.palette().background.weak.color));
+                    if draws {
+                        style.background = Some(Background::Color(palette.primary.weak.color));
+                        style.text_color = palette.primary.weak.text;
+                        style.border = Border {
+                            color: palette.primary.base.color,
+                            width: 1.0,
+                            radius: 4.0.into(),
+                        };
+                    } else {
+                        style.background = Some(Background::Color(palette.background.weak.color));
+                    }
                     style
                 })
                 .width(Length::Fill)
-                .padding([3, 6]),
-            );
+                .padding([3, 6]);
+            tree = tree.push(if draws {
+                Element::from(
+                    tooltip(
+                        heading,
+                        tip_box(
+                            t!("These nodes draw objects in the drawing and keep them up to date. The other categories only compute values.")
+                                .into_owned(),
+                        ),
+                        tooltip::Position::Bottom,
+                    )
+                    .gap(2),
+                )
+            } else {
+                heading.into()
+            });
             if open {
                 for item in items {
                     tree = tree.push(self.palette_entry(item));
