@@ -73,7 +73,7 @@ impl OpenCADStudio {
         if graph
             .engine
             .node(id)
-            .is_some_and(|node| is_draw(&node.kind))
+            .is_some_and(|node| is_placing(&node.kind))
         {
             return self.graph_draw_sections(i, id);
         }
@@ -90,39 +90,41 @@ impl OpenCADStudio {
         graph_rows(panel, json!({ "handle": first.value() }), value)
     }
 
-    /// A Draw node's rows: what it draws and how, and the entities it drew.
+    /// A placing node's rows: what it draws and how, and the entities it
+    /// drew.
     fn graph_draw_sections(&self, i: usize, id: NodeId) -> Vec<NodeSection> {
         let graph = &self.tabs[i].graph;
-        let outputs = graph.engine.node(id).map(|node| &node.outputs);
+        let Some(node) = graph.engine.node(id) else {
+            return Vec::new();
+        };
+        let Kind::Object(name) = &node.kind else {
+            return Vec::new();
+        };
+        let Some(kind) = ObjectKind::from_name(name) else {
+            return Vec::new();
+        };
         let first = graph.ui.get(&id).and_then(|ui| ui.handles.first().copied());
-        let value = |field: &str| {
-            outputs
-                .and_then(|outputs| outputs.get(field))
-                .cloned()
-                .unwrap_or(Value::Null)
-        };
-        let row = |field: &str, label: &str, input: bool, kind: Type, list: bool| NodeRow {
-            field: field.to_owned(),
-            label: crate::t!(label).into_owned(),
-            value: match (field, first) {
-                ("object", Some(handle)) if value(field).is_null() => {
-                    json!({ "handle": handle.value() })
-                }
-                _ => value(field),
-            },
-            input,
-            output: true,
-            widget: RowWidget::Field,
-            kind: Some(PortType { kind, list }),
-        };
+        let value = |field: &str| node.outputs.get(field).cloned().unwrap_or(Value::Null);
+        let rows = place_fields(kind)
+            .iter()
+            .map(|&(field, label, input, kind, list)| NodeRow {
+                field: field.to_owned(),
+                label: crate::t!(label).into_owned(),
+                value: match (field, first) {
+                    ("object", Some(handle)) if value(field).is_null() => {
+                        json!({ "handle": handle.value() })
+                    }
+                    _ => value(field),
+                },
+                input,
+                output: true,
+                widget: RowWidget::Field,
+                kind: Some(PortType { kind, list }),
+            })
+            .collect();
         vec![NodeSection {
             title: String::new(),
-            rows: vec![
-                row("object", "Object", false, Type::Object, false),
-                row("geometry", "Geometry", true, Type::Curve, true),
-                row("layer", "Layer", true, Type::Text, false),
-                row("color", "Color", true, Type::Number, false),
-            ],
+            rows,
         }]
     }
 
@@ -135,20 +137,17 @@ impl OpenCADStudio {
     ) -> Vec<crate::app::graph_ops::Field> {
         use crate::app::graph_ops::{property_kind, Field};
         use crate::ui::node_graph::Expect;
-        if kind == ObjectKind::Draw {
-            let field = |name: &str, label: &str, input: bool, kind: Expect| Field {
-                name: name.to_owned(),
-                label: crate::t!(label).into_owned(),
-                input,
-                output: true,
-                kind,
-            };
-            return vec![
-                field("object", "Object", false, Expect::Object),
-                field("geometry", "Geometry", true, Expect::Curve),
-                field("layer", "Layer", true, Expect::Text),
-                field("color", "Color", true, Expect::Any),
-            ];
+        if kind.places() {
+            return place_fields(kind)
+                .iter()
+                .map(|&(name, label, input, kind, list)| Field {
+                    name: name.to_owned(),
+                    label: crate::t!(label).into_owned(),
+                    input,
+                    output: true,
+                    kind: Expect::of_type(PortType { kind, list }),
+                })
+                .collect();
         }
         let panel = self.graph_entity_sections(i, Handle::NULL, &kind.entity());
         let object = Field {
@@ -308,7 +307,7 @@ impl OpenCADStudio {
         let (shown, active) = (self.show_node_graph, self.active_tab);
         for (k, tab) in self.tabs.iter_mut().enumerate() {
             tab.scene.graph_preview_wires = if shown && k == active && !tab.graph.preview_hidden {
-                preview_wires(&tab.graph)
+                preview_wires(&tab.graph, &tab.scene.document)
             } else {
                 Vec::new()
             };
@@ -324,6 +323,7 @@ impl OpenCADStudio {
         &mut self,
         i: usize,
         node: NodeId,
+        kind: ObjectKind,
         instances: &[Vec<(String, Value)>],
     ) -> Vec<Vec<(String, Value)>> {
         let mut spare: Vec<Handle> = self.tabs[i]
@@ -342,11 +342,8 @@ impl OpenCADStudio {
                     .find(|(field, _)| field == name)
                     .map(|(_, value)| value.clone())
             };
-            let geometry = get("geometry").unwrap_or(Value::Null);
-            // Nested lists (an array of arrays) draw every curve they hold.
-            let mut curves = Vec::new();
-            collect_curves(&geometry, &mut curves);
             let document = &self.tabs[i].scene.document;
+            let entities = place_entities(kind, &get, document);
             let layer = get("layer")
                 .map(|value| graph::value::text(&value).trim().to_owned())
                 .filter(|name| document.layers.get(name).is_some())
@@ -360,10 +357,7 @@ impl OpenCADStudio {
                 _ => codec::types::Color::ByLayer,
             };
             let mut objects = Vec::new();
-            for curve in curves {
-                let Some(mut entity) = crate::entities::curve::curve_entity(&curve) else {
-                    continue;
-                };
+            for mut entity in entities {
                 let document = &self.tabs[i].scene.document;
                 let reuse = spare.iter().position(|handle| {
                     document.get_entity(*handle).is_some_and(|existing| {
@@ -403,8 +397,12 @@ impl OpenCADStudio {
             } else {
                 Value::Array(objects)
             };
-            results.push(vec![
-                ("geometry".to_owned(), geometry),
+            let mut result: Vec<(String, Value)> = fields
+                .iter()
+                .filter(|(field, _)| !matches!(field.as_str(), "layer" | "color" | "object"))
+                .cloned()
+                .collect();
+            result.extend([
                 ("layer".to_owned(), json!(layer)),
                 (
                     "color".to_owned(),
@@ -415,6 +413,7 @@ impl OpenCADStudio {
                 ),
                 ("object".to_owned(), object),
             ]);
+            results.push(result);
         }
         if !spare.is_empty() {
             self.tabs[i].scene.erase_entities(&spare);
@@ -447,7 +446,9 @@ impl OpenCADStudio {
                 }
                 self.graph_refresh_preview();
             }
-            GraphMsg::TogglePreview => self.graph_refresh_preview(),
+            GraphMsg::TogglePreview | GraphMsg::Hover(_) | GraphMsg::HoverEnd(_) => {
+                self.graph_refresh_preview()
+            }
             GraphMsg::Add(item) => {
                 self.tabs[i].graph.record();
                 self.tabs[i].graph.add_node(item, Vec::new());
@@ -459,7 +460,9 @@ impl OpenCADStudio {
             | GraphMsg::Unlink(_)
             | GraphMsg::PickNewInput(..)
             | GraphMsg::Move(..)
-            | GraphMsg::MoveNow(..) => {
+            | GraphMsg::MoveNow(..)
+            | GraphMsg::DragDrop(_)
+            | GraphMsg::MoveToNow(..) => {
                 if self.tabs[i].graph.confirm.is_none() {
                     return self.graph_run(i);
                 }
@@ -551,8 +554,67 @@ impl OpenCADStudio {
                 return self.graph_set(i, port, value);
             }
             GraphMsg::Set(port, value) => return self.graph_set(i, port, value),
+            // Typing in the paste box changes nothing; a paste of rows does.
+            GraphMsg::TablePaste(port, text) if text.contains(['\t', '\n']) => {
+                self.tabs[i].graph.record();
+                let rows = graph::value::table(&Value::String(text));
+                let value = Value::Array(rows.into_iter().map(Value::Array).collect());
+                return self.graph_set(i, port, value);
+            }
             GraphMsg::New => {
                 self.tabs[i].graph.clear();
+            }
+            GraphMsg::CompositeEditSave => return self.graph_run(i),
+            GraphMsg::LibraryExport => {
+                let bytes = crate::ui::node_graph::library_file();
+                return Task::perform(
+                    async move {
+                        let handle = crate::sys::file_dialog()
+                            .set_title(crate::t!("Export the composite library").as_ref())
+                            .add_filter(crate::t!("Composites").as_ref(), &["json"])
+                            .set_file_name("composites.json")
+                            .save_file()
+                            .await?;
+                        let name = crate::sys::handle_path(&handle)
+                            .to_string_lossy()
+                            .into_owned();
+                        Some(
+                            handle
+                                .write(&bytes)
+                                .await
+                                .map(|()| name)
+                                .map_err(|e| e.to_string()),
+                        )
+                    },
+                    |result| Message::Graph(GraphMsg::LibraryExported(result)),
+                );
+            }
+            GraphMsg::LibraryExported(Some(Ok(name))) => self
+                .command_line
+                .push_output(crate::tf!("Composite library exported to {}", name).as_ref()),
+            GraphMsg::LibraryExported(Some(Err(error))) => self.command_line.push_error(&error),
+            GraphMsg::LibraryImport => {
+                return Task::perform(
+                    async {
+                        let handle = crate::sys::file_dialog()
+                            .set_title(crate::t!("Import composites").as_ref())
+                            .add_filter(crate::t!("Composites").as_ref(), &["json"])
+                            .pick_file()
+                            .await?;
+                        Some(handle.read().await)
+                    },
+                    |bytes| Message::Graph(GraphMsg::LibraryImported(bytes)),
+                );
+            }
+            GraphMsg::LibraryImported(Some(bytes)) => {
+                match crate::ui::node_graph::import_library(&bytes) {
+                    Ok(count) => self.command_line.push_output(
+                        crate::tf!("{} composites added to the library", count).as_ref(),
+                    ),
+                    Err(error) => self
+                        .command_line
+                        .push_error(crate::tf!("Not a composite library: {}", error).as_ref()),
+                }
             }
             GraphMsg::Save => {
                 // The file names the drawing by its fingerprint so reopening it
@@ -772,8 +834,8 @@ impl graph::Host for AppHost<'_> {
         let Some(kind) = ObjectKind::from_name(kind) else {
             return Vec::new();
         };
-        if kind == ObjectKind::Draw {
-            return app.graph_draw(i, node, instances);
+        if kind.places() {
+            return app.graph_draw(i, node, kind, instances);
         }
         let mut handles: Vec<Handle> = app.tabs[i]
             .graph
@@ -848,40 +910,228 @@ fn collect_curves(value: &Value, curves: &mut Vec<kernel::space::PlanarCurve>) {
     }
 }
 
-/// Whether `kind` is the Draw Geometry node.
-fn is_draw(kind: &Kind) -> bool {
-    matches!(kind, Kind::Object(name) if name == ObjectKind::Draw.name())
+/// Whether `kind` is a node whose entities follow its inputs.
+fn is_placing(kind: &Kind) -> bool {
+    matches!(kind, Kind::Object(name) if ObjectKind::from_name(name).is_some_and(ObjectKind::places))
+}
+
+/// A placing node's rows: field, label, whether it is an input, and the
+/// kind of value it takes. Every one ends with the layer and colour it
+/// draws on, and the entities it drew.
+fn place_fields(kind: ObjectKind) -> Vec<(&'static str, &'static str, bool, Type, bool)> {
+    let mut fields = vec![("object", "Object", false, Type::Object, false)];
+    fields.extend_from_slice(match kind {
+        ObjectKind::Hatch => &[
+            ("boundary", "Boundary", true, Type::Curve, true),
+            ("pattern", "Pattern", true, Type::Text, false),
+            ("scale", "Scale", true, Type::Number, false),
+            ("angle", "Angle", true, Type::Number, false),
+        ][..],
+        ObjectKind::Block => &[
+            ("block", "Block", true, Type::Text, false),
+            ("point", "Point", true, Type::Point, false),
+            ("rotation", "Rotation", true, Type::Number, false),
+            ("scale", "Scale", true, Type::Number, false),
+        ][..],
+        ObjectKind::Dimension => &[
+            ("from", "From", true, Type::Point, false),
+            ("to", "To", true, Type::Point, false),
+            ("offset", "Offset", true, Type::Number, false),
+            ("text", "Text", true, Type::Text, false),
+        ][..],
+        _ => &[("geometry", "Geometry", true, Type::Curve, true)][..],
+    });
+    fields.push(("layer", "Layer", true, Type::Text, false));
+    fields.push(("color", "Color", true, Type::Number, false));
+    fields
+}
+
+/// What a placing node of `kind` draws from one set of its inputs.
+fn place_entities(
+    kind: ObjectKind,
+    get: &dyn Fn(&str) -> Option<Value>,
+    document: &codec::CadDocument,
+) -> Vec<codec::EntityType> {
+    use codec::entities as e;
+    use codec::types::Vector3;
+    let number = |field: &str, default: f64| {
+        get(field)
+            .as_ref()
+            .and_then(graph::value::num)
+            .unwrap_or(default)
+    };
+    let point = |field: &str| get(field).as_ref().and_then(graph::value::point);
+    match kind {
+        ObjectKind::Hatch => {
+            let mut curves = Vec::new();
+            collect_curves(&get("boundary").unwrap_or(Value::Null), &mut curves);
+            let paths: Vec<e::BoundaryPath> = curves
+                .iter()
+                .filter(|curve| curve.curve.is_closed())
+                .filter_map(boundary_path)
+                .enumerate()
+                .map(|(k, edge)| {
+                    let mut path = if k == 0 {
+                        e::BoundaryPath::external()
+                    } else {
+                        e::BoundaryPath::new()
+                    };
+                    path.add_edge(edge);
+                    path
+                })
+                .collect();
+            if paths.is_empty() {
+                return Vec::new();
+            }
+            let pattern = get("pattern")
+                .map(|value| graph::value::text(&value).trim().to_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "SOLID".to_owned());
+            let mut hatch = if pattern.eq_ignore_ascii_case("SOLID") {
+                e::Hatch::solid()
+            } else {
+                e::Hatch::with_pattern(e::HatchPattern::new(pattern.to_uppercase()))
+                    .with_pattern_scale(number("scale", 1.0).abs().max(1e-6))
+                    .with_pattern_angle(number("angle", 0.0).to_radians())
+            };
+            hatch.paths = paths;
+            vec![codec::EntityType::Hatch(Box::new(hatch))]
+        }
+        ObjectKind::Block => {
+            let name = get("block").map_or_else(String::new, |value| graph::value::text(&value));
+            let Some(at) = point("point") else {
+                return Vec::new();
+            };
+            if document.block_records.get(name.trim()).is_none() {
+                return Vec::new();
+            }
+            let insert = e::Insert::new(name.trim(), Vector3::new(at[0], at[1], at[2]))
+                .with_uniform_scale(number("scale", 1.0))
+                .with_rotation(number("rotation", 0.0).to_radians());
+            vec![codec::EntityType::Insert(insert)]
+        }
+        ObjectKind::Dimension => {
+            let (Some(from), Some(to)) = (point("from"), point("to")) else {
+                return Vec::new();
+            };
+            let (from, to) = (glam::DVec3::from_array(from), glam::DVec3::from_array(to));
+            let along = to - from;
+            if along.length() <= 1e-9 {
+                return Vec::new();
+            }
+            let left = glam::DVec3::new(-along.y, along.x, 0.0).normalize_or_zero();
+            let line = (from + to) * 0.5 + left * number("offset", 1.0);
+            let text = get("text")
+                .map(|value| graph::value::text(&value))
+                .filter(|text| !text.trim().is_empty());
+            vec![
+                crate::modules::annotate::aligned_dim::aligned_dimension_entity(
+                    from, to, line, text,
+                ),
+            ]
+        }
+        _ => {
+            let mut curves = Vec::new();
+            collect_curves(&get("geometry").unwrap_or(Value::Null), &mut curves);
+            curves
+                .iter()
+                .filter_map(crate::entities::curve::curve_entity)
+                .collect()
+        }
+    }
+}
+
+/// A closed curve on a plane facing up as one hatch boundary edge, in world
+/// coordinates; arcs keep their bulges.
+fn boundary_path(curve: &kernel::space::PlanarCurve) -> Option<codec::entities::BoundaryEdge> {
+    use codec::types::Vector3;
+    use kernel::geom2d::Curve;
+    let normal = curve.normal()?;
+    if (normal[2] - 1.0).abs() > 1e-9 {
+        return None;
+    }
+    let world = |p: [f64; 2], bulge: f64| {
+        let w = curve.plane.point_at(p);
+        Vector3::new(w[0], w[1], bulge)
+    };
+    let vertices = match &curve.curve {
+        Curve::Polyline(polyline) => polyline
+            .vertices
+            .iter()
+            .map(|vertex| world(vertex.position, vertex.bulge))
+            .collect(),
+        Curve::Circle(circle) => {
+            let [x, y] = circle.centre;
+            vec![
+                world([x + circle.radius, y], 1.0),
+                world([x - circle.radius, y], 1.0),
+            ]
+        }
+        _ => return None,
+    };
+    Some(codec::entities::BoundaryEdge::Polyline(
+        codec::entities::PolylineEdge {
+            vertices,
+            is_closed: true,
+        },
+    ))
 }
 
 /// Accent of the graph's curve preview.
 const PREVIEW_COLOR: [f32; 4] = [1.0, 0.55, 0.1, 0.9];
+/// The geometry of the card under the pointer.
+const HIGHLIGHT_COLOR: [f32; 4] = [0.1, 0.85, 1.0, 1.0];
 
 /// The curves operation nodes compute, as overlay wires. Drawn objects show
 /// themselves; unbounded curves (rays, construction lines) are left out.
-fn preview_wires(graph: &crate::ui::node_graph::Graph) -> Vec<crate::scene::WireModel> {
+fn preview_wires(
+    graph: &crate::ui::node_graph::Graph,
+    document: &codec::CadDocument,
+) -> Vec<crate::scene::WireModel> {
     let mut wires = Vec::new();
-    for node in &graph.engine.nodes {
-        if !matches!(node.kind, Kind::Op(_)) {
-            continue;
+    let mut add = |name: String, curve: &kernel::space::PlanarCurve, color: [f32; 4]| {
+        if curve.curve.extent() != kernel::geom2d::Extent::Bounded {
+            return;
         }
-        let mut curves = Vec::new();
-        node.outputs
-            .values()
-            .for_each(|value| collect_curves(value, &mut curves));
-        for (k, curve) in curves.into_iter().enumerate() {
-            if curve.curve.extent() != kernel::geom2d::Extent::Bounded {
-                continue;
+        let tolerance = (curve.length() * 1e-3).max(1e-6);
+        let points = curve.tessellate_within(tolerance);
+        if points.len() >= 2 {
+            wires.push(crate::scene::WireModel::solid_f64(
+                name, points, color, false,
+            ));
+        }
+    };
+    for node in &graph.engine.nodes {
+        let hovered = graph.hovered == Some(node.id);
+        let color = if hovered {
+            HIGHLIGHT_COLOR
+        } else {
+            PREVIEW_COLOR
+        };
+        match node.kind {
+            Kind::Op(_) | Kind::Composite(_) => {
+                let mut curves = Vec::new();
+                node.outputs
+                    .values()
+                    .for_each(|value| collect_curves(value, &mut curves));
+                for (k, curve) in curves.iter().enumerate() {
+                    add(format!("graph-preview-{}-{k}", node.id), curve, color);
+                }
             }
-            let tolerance = (curve.length() * 1e-3).max(1e-6);
-            let points = curve.tessellate_within(tolerance);
-            if points.len() >= 2 {
-                wires.push(crate::scene::WireModel::solid_f64(
-                    format!("graph-preview-{}-{k}", node.id),
-                    points,
-                    PREVIEW_COLOR,
-                    false,
-                ));
+            // Drawn objects show themselves; the hovered node's are traced
+            // over them.
+            Kind::Object(_) if hovered => {
+                let handles = graph.ui.get(&node.id).map(|ui| ui.handles.as_slice());
+                for (k, handle) in handles.unwrap_or_default().iter().enumerate() {
+                    let curve = document
+                        .get_entity(*handle)
+                        .and_then(crate::entities::curve::entity_curve);
+                    if let Some(curve) = curve {
+                        add(format!("graph-hover-{}-{k}", node.id), &curve, color);
+                    }
+                }
             }
+            Kind::Object(_) => {}
         }
     }
     wires

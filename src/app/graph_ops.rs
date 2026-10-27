@@ -982,6 +982,13 @@ fn node_json(
     if is_input(&node.kind) {
         value["values"] = json!(node.params);
     }
+    if !node.issues.is_empty() {
+        value["issues"] = json!(node
+            .issues
+            .iter()
+            .map(graph::Issue::message)
+            .collect::<Vec<_>>());
+    }
     if summary {
         return value;
     }
@@ -1803,6 +1810,80 @@ mod tests {
         assert_eq!(moved["ok"], true, "{moved}");
         let query = app.automation_op(r#"{"op":"query","type":"Line","detail":"geometry"}"#);
         assert!(query.to_string().contains("8.5"), "{query}");
+    }
+
+    /// Hatches fill regions, holes included, dimensions measure, blocks
+    /// place a reference per point, and a step that cannot compute says why.
+    #[test]
+    fn placing_nodes_hatch_dimension_and_insert() {
+        let mut app = app();
+        let i = app.active_tab;
+        let document = &mut app.tabs[i].scene.document;
+        let mut record = codec::tables::BlockRecord::new("POST");
+        record.handle = document.allocate_handle();
+        document.block_records.add(record).unwrap();
+        let built = apply_changes(
+            &mut app,
+            "p1",
+            json!([
+                {"add": "Number", "name": "Size", "values": {"value": 10}},
+                {"add": "Number", "name": "Hole", "values": {"value": 2}},
+                {"add": "Text", "source": "builtin", "name": "Post", "values": {"value": "POST"}},
+                {"add": "Point", "source": "builtin", "name": "O"},
+                {"add": "Point", "source": "builtin", "name": "Q"},
+                {"link": "Hole.value", "to": "Q.x"},
+                {"link": "Hole.value", "to": "Q.y"},
+                {"add": "Rectangle", "name": "Slab"},
+                {"link": "O.point", "to": "Slab.corner"},
+                {"link": "Size.value", "to": "Slab.width"},
+                {"link": "Size.value", "to": "Slab.height"},
+                {"add": "Rectangle", "name": "Opening"},
+                {"link": "Q.point", "to": "Opening.corner"},
+                {"link": "Hole.value", "to": "Opening.width"},
+                {"link": "Hole.value", "to": "Opening.height"},
+                {"add": "Region Difference", "name": "Net"},
+                {"link": "Slab.curve", "to": "Net.a"},
+                {"link": "Opening.curve", "to": "Net.b"},
+                {"add": "Hatch", "name": "Fill"},
+                {"link": "Net.regions", "to": "Fill.boundary"},
+                {"add": "Curve Endpoints", "name": "Corners"},
+                {"link": "Slab.curve", "to": "Corners.curve"},
+                {"add": "Aligned Dimension", "name": "Width"},
+                {"link": "O.point", "to": "Width.from"},
+                {"link": "Q.point", "to": "Width.to"},
+                {"add": "Divide Curve", "name": "Posts at"},
+                {"link": "Slab.curve", "to": "Posts at.curve"},
+                {"link": "Hole.value", "to": "Posts at.count"},
+                {"add": "Insert Block", "name": "Posts"},
+                {"link": "Post.value", "to": "Posts.block"},
+                {"link": "Posts at.points", "to": "Posts.point"},
+                {"add": "Line Curve", "name": "Loose"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        let entities = |name: &str| {
+            node(&state, "sequence", name)["entities"]
+                .as_array()
+                .map_or(0, Vec::len)
+        };
+        let net = node(&state, "sequence", "Net")["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|port| port["name"] == "area")
+            .unwrap()["value"]
+            .clone();
+        assert_eq!(net, json!(96.0));
+        assert_eq!(entities("Fill"), 1, "one hatch with its hole");
+        assert_eq!(entities("Width"), 1);
+        assert_eq!(entities("Posts"), 3, "a post at each of 3 points");
+        let hatch = app.automation_op(r#"{"op":"query","type":"Hatch","detail":"summary"}"#);
+        assert_eq!(hatch["count"], 1, "{hatch}");
+        assert_eq!(
+            node(&state, "sequence", "Loose")["issues"],
+            json!(["Nothing feeds start"])
+        );
     }
 
     #[test]

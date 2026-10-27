@@ -58,6 +58,7 @@ const INPUT_KINDS: &[&str] = &[
     "Integer Slider",
     "Text",
     "Boolean",
+    "Table",
 ];
 
 /// Whether `kind` is an Inputs-area node rather than a step of the node sequence.
@@ -78,9 +79,15 @@ pub enum ObjectKind {
     XLine,
     Text,
     MText,
-    /// Draws curve values the graph computes: the one object node whose
-    /// entity kind follows its input.
+    /// Draws curve values the graph computes: an object node whose
+    /// entities follow its inputs rather than its own properties.
     Draw,
+    /// Fills closed curves with a hatch pattern.
+    Hatch,
+    /// Places references of a block.
+    Block,
+    /// Places aligned dimensions between two points.
+    Dimension,
 }
 
 const OBJECTS: &[ObjectKind] = &[
@@ -95,6 +102,9 @@ const OBJECTS: &[ObjectKind] = &[
     ObjectKind::Text,
     ObjectKind::MText,
     ObjectKind::Draw,
+    ObjectKind::Hatch,
+    ObjectKind::Block,
+    ObjectKind::Dimension,
 ];
 
 impl ObjectKind {
@@ -115,6 +125,9 @@ impl ObjectKind {
             ObjectKind::Text => "Text",
             ObjectKind::MText => "Multiline Text",
             ObjectKind::Draw => "Draw Geometry",
+            ObjectKind::Hatch => "Hatch",
+            ObjectKind::Block => "Insert Block",
+            ObjectKind::Dimension => "Aligned Dimension",
         }
     }
 
@@ -132,6 +145,9 @@ impl ObjectKind {
             ObjectKind::Text => "Draws a single-line text: contents, position, height and rotation can all come from other nodes.",
             ObjectKind::MText => "Draws a multiline text and keeps it in step with its inputs.",
             ObjectKind::Draw => "Draws every curve it receives, on a layer and in a colour, and keeps the drawing in step with them.",
+            ObjectKind::Hatch => "Fills closed curves with a hatch: one hatch per region, a list holding an outline and its holes. SOLID fills; any other name is a hatch pattern, at a scale and an angle in degrees.",
+            ObjectKind::Block => "Places a block of the drawing at each point, turned by an angle in degrees and scaled: doors, windows, trees or posts along an axis. A block the drawing lacks places nothing.",
+            ObjectKind::Dimension => "Places an aligned dimension between two points, its line an offset to their left; the text, when given, replaces the measurement.",
         }
     }
 
@@ -141,7 +157,19 @@ impl ObjectKind {
 
     /// The kind of a drawn entity, when a node can own it.
     pub fn of(entity: &EntityType) -> Option<Self> {
-        OBJECTS.iter().copied().find(|kind| kind.matches(entity))
+        OBJECTS
+            .iter()
+            .copied()
+            .find(|kind| !kind.places() && kind.matches(entity))
+    }
+
+    /// Whether the node's entities come from its inputs (geometry, points,
+    /// a block name…) rather than from properties of its own.
+    pub fn places(self) -> bool {
+        matches!(
+            self,
+            ObjectKind::Draw | ObjectKind::Hatch | ObjectKind::Block | ObjectKind::Dimension
+        )
     }
 
     /// Whether `entity` is this kind of object.
@@ -167,6 +195,9 @@ impl ObjectKind {
                         | EntityType::Ray(_)
                         | EntityType::XLine(_)
                 )
+                | (ObjectKind::Hatch, EntityType::Hatch(_))
+                | (ObjectKind::Block, EntityType::Insert(_))
+                | (ObjectKind::Dimension, EntityType::Dimension(_))
         )
     }
 
@@ -183,6 +214,9 @@ impl ObjectKind {
             ObjectKind::Text => "TEXT",
             ObjectKind::MText => "MTEXT",
             ObjectKind::Draw => "",
+            ObjectKind::Hatch => "HATCH",
+            ObjectKind::Block => "INSERT",
+            ObjectKind::Dimension => "DIMALIGNED",
         }
     }
 
@@ -224,8 +258,8 @@ impl ObjectKind {
             ObjectKind::MText => EntityType::MText(Box::new(
                 e::MText::with_value("MText", origin).with_height(2.5),
             )),
-            // A Draw node's entities come from its geometry input.
-            ObjectKind::Draw => {
+            // These nodes' entities come from their inputs.
+            ObjectKind::Draw | ObjectKind::Hatch | ObjectKind::Block | ObjectKind::Dimension => {
                 EntityType::Line(e::Line::from_coords(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
             }
         }
@@ -339,6 +373,33 @@ pub fn save_to_library(composite: Arc<Composite>) {
     }
 }
 
+/// The library as a file: the same JSON list it is stored as.
+pub fn library_file() -> Vec<u8> {
+    Value::Array(
+        composite_library()
+            .iter()
+            .map(|item| item.to_json())
+            .collect(),
+    )
+    .to_string()
+    .into_bytes()
+}
+
+/// Adds the composites of a library file, replacing those of the same
+/// names; how many it held, or why it is not a library.
+pub fn import_library(bytes: &[u8]) -> Result<usize, String> {
+    let items: Vec<Value> = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let composites: Vec<Composite> = items
+        .iter()
+        .map(Composite::from_json)
+        .collect::<Result<_, _>>()?;
+    let count = composites.len();
+    for composite in composites {
+        save_to_library(Arc::new(composite));
+    }
+    Ok(count)
+}
+
 /// Drops library entry `k`.
 pub fn forget_library_entry(k: usize) {
     if let Ok(mut items) = library_store().lock() {
@@ -390,11 +451,16 @@ pub(crate) fn describe(kind: &Kind) -> String {
         Kind::Object(name) => ObjectKind::from_name(name)
             .map(|kind| t!(kind.description()).into_owned())
             .unwrap_or_default(),
-        Kind::Composite(composite) => crate::tf!(
-            "A composite of {} steps used as one node. Expand it to see or change them.",
-            composite.graph.nodes.len()
-        )
-        .into_owned(),
+        Kind::Composite(composite) => {
+            let made_of = crate::tf!(
+                "A composite of {} steps used as one node. Expand it to see or change them.",
+                composite.graph.nodes.len()
+            );
+            match composite_description(composite) {
+                "" => made_of.into_owned(),
+                about => format!("{about}\n{made_of}"),
+            }
+        }
     }
 }
 
@@ -490,6 +556,176 @@ fn signature(spec: &Spec) -> Option<String> {
     Some(format!("{} → {}", names(&doc.inputs), names(&doc.outputs)))
 }
 
+/// A Table node's cells as text, the first row its column names; an empty
+/// table starts with two named columns and one row.
+fn table_cells(value: &Value) -> Vec<Vec<String>> {
+    let mut cells: Vec<Vec<String>> = graph::value::table(value)
+        .iter()
+        .map(|row| row.iter().map(display).collect())
+        .collect();
+    if cells.is_empty() {
+        cells = vec![
+            vec!["A".to_owned(), "B".to_owned()],
+            vec![String::new(), String::new()],
+        ];
+    }
+    let width = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    for row in &mut cells {
+        row.resize(width, String::new());
+    }
+    cells
+}
+
+fn table_value(cells: &[Vec<String>]) -> Value {
+    Value::Array(
+        cells
+            .iter()
+            .map(|row| Value::Array(row.iter().cloned().map(Value::String).collect()))
+            .collect(),
+    )
+}
+
+/// A Table node's grid: a cell per value, buttons to add or drop a row or a
+/// column, and a box rows copied from a spreadsheet can be pasted into.
+fn table_editor<'a>(port: Port, value: &Value) -> Element<'a, Message> {
+    let cells = table_cells(value);
+    let mut grid = column![].spacing(2);
+    for (r, row_cells) in cells.iter().enumerate() {
+        let mut line = row![].spacing(2);
+        for (c, cell) in row_cells.iter().enumerate() {
+            let (cells, port) = (cells.clone(), port.clone());
+            let input = text_input("", cell)
+                .on_input(move |text| {
+                    let mut cells = cells.clone();
+                    cells[r][c] = text;
+                    msg(GraphMsg::Set(port.clone(), table_value(&cells)))
+                })
+                .size(11)
+                .padding([2, 4])
+                .width(Length::Fill);
+            // The first row names the columns.
+            line = line.push(if r == 0 {
+                Element::from(container(input).style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(theme.palette().primary.weak.color)),
+                    ..Default::default()
+                }))
+            } else {
+                input.into()
+            });
+        }
+        grid = grid.push(line);
+    }
+    let (rows, columns) = (cells.len(), cells[0].len());
+    let mut added_row = cells.clone();
+    added_row.push(vec![String::new(); columns]);
+    let mut added_column = cells.clone();
+    added_column.iter_mut().enumerate().for_each(|(r, row)| {
+        row.push(if r == 0 {
+            char::from(b'A' + (columns % 26) as u8).to_string()
+        } else {
+            String::new()
+        })
+    });
+    let mut dropped_row = cells.clone();
+    dropped_row.pop();
+    let mut dropped_column = cells.clone();
+    dropped_column.iter_mut().for_each(|row| {
+        row.pop();
+    });
+    let pasted = port.clone();
+    let paste = text_input(&t!("Paste rows from a spreadsheet…"), "")
+        .on_input({
+            let port = pasted.clone();
+            move |text| msg(GraphMsg::TablePaste(port.clone(), text))
+        })
+        .on_paste(move |text| msg(GraphMsg::TablePaste(pasted.clone(), text)))
+        .size(10)
+        .padding([2, 4])
+        .width(Length::Fill);
+    column![
+        grid,
+        row![
+            icon_button(
+                crate::ui::icons::PLUS,
+                "Add row",
+                Some(GraphMsg::Set(port.clone(), table_value(&added_row)))
+            ),
+            icon_button(
+                crate::ui::icons::MINUS,
+                "Remove last row",
+                (rows > 2).then(|| GraphMsg::Set(port.clone(), table_value(&dropped_row)))
+            ),
+            Space::new().width(8.0),
+            icon_button(
+                crate::ui::icons::PLUS,
+                "Add column",
+                (columns < 8).then(|| GraphMsg::Set(port.clone(), table_value(&added_column)))
+            ),
+            icon_button(
+                crate::ui::icons::MINUS,
+                "Remove last column",
+                (columns > 1).then(|| GraphMsg::Set(port.clone(), table_value(&dropped_column)))
+            ),
+            paste,
+        ]
+        .spacing(2)
+        .align_y(iced::Center),
+    ]
+    .spacing(4)
+    .into()
+}
+
+/// Why a node gave no result, in the interface's language.
+pub(crate) fn issue_text(issue: &graph::Issue) -> String {
+    match issue {
+        graph::Issue::Missing(input) => crate::tf!("Nothing feeds {}", input).into_owned(),
+        graph::Issue::EmptyList(input) => crate::tf!("The list on {} is empty", input).into_owned(),
+        graph::Issue::NoResult => t!("No result with these values").into_owned(),
+        graph::Issue::Inner(step, issue) => format!("{}: {}", t!(step.as_str()), issue_text(issue)),
+    }
+}
+
+/// The amber of a node's issues.
+const ISSUE_COLOR: Color = Color::from_rgb8(0xF5, 0x9E, 0x0B);
+
+/// A list's first items, one per line, under its length; `None` for a
+/// single value, which its row already shows whole.
+fn list_preview(value: &Value) -> Option<String> {
+    const SHOWN: usize = 12;
+    let items = value.as_array()?;
+    let mut lines = vec![crate::tf!("{} items", items.len()).into_owned()];
+    lines.extend(
+        items
+            .iter()
+            .take(SHOWN)
+            .enumerate()
+            .map(|(k, item)| format!("{k}: {}", display(item))),
+    );
+    if items.len() > SHOWN {
+        lines.push("…".to_owned());
+    }
+    Some(lines.join("\n"))
+}
+
+/// `content` with its list's preview as a tooltip, when it holds a list.
+fn with_list_preview<'a>(
+    content: Element<'a, Message>,
+    preview: Option<String>,
+) -> Element<'a, Message> {
+    match preview {
+        Some(preview) => tooltip(
+            content,
+            container(text(preview).size(10).font(iced::Font::MONOSPACE))
+                .padding([4, 8])
+                .style(container::bordered_box),
+            tooltip::Position::Bottom,
+        )
+        .gap(4)
+        .into(),
+        None => content,
+    }
+}
+
 /// A tooltip box holding a paragraph.
 fn tip_box<'a>(content: String) -> Element<'a, Message> {
     // Containers take no maximum width: a long paragraph gets a fixed one
@@ -535,8 +771,14 @@ pub struct NodeGroup {
 
 pub enum RowWidget {
     Field,
-    Slider { min: f64, max: f64, step: f64 },
+    Slider {
+        min: f64,
+        max: f64,
+        step: f64,
+    },
     Toggle,
+    /// A grid of cells, the first row its column names.
+    Table,
 }
 
 /// A group of rows; an empty title has no header and is always open.
@@ -573,6 +815,23 @@ pub struct Confirm {
     pub delete: bool,
     /// Links the edit removes.
     pub links: Vec<Link>,
+}
+
+/// What the composite editor is changing: the node, then the composite's
+/// name and description, and for each input its current name, new name and
+/// default value, and for each output its current and new names.
+#[derive(Clone, Debug)]
+pub struct CompositeDraft {
+    pub node: NodeId,
+    pub name: String,
+    pub description: String,
+    pub inputs: Vec<(String, String, String)>,
+    pub outputs: Vec<(String, String)>,
+}
+
+/// A composite's description, kept in its host metadata.
+pub(crate) fn composite_description(composite: &Composite) -> &str {
+    composite.meta["description"].as_str().unwrap_or_default()
 }
 
 /// Everything an undo step restores.
@@ -738,6 +997,15 @@ pub struct Graph {
     pub picking: Option<Port>,
     /// Filter typed into the picker's search box.
     pick_search: String,
+    /// The picker shows only values of the kind the input takes.
+    pub pick_compatible: bool,
+    /// The card under the pointer: its geometry is highlighted in the
+    /// drawing, and a dragged card drops onto it.
+    pub hovered: Option<NodeId>,
+    /// The card being dragged to a new place.
+    pub dragging: Option<NodeId>,
+    /// A composite node's name, description and ports being edited.
+    pub editing: Option<CompositeDraft>,
     /// What is being renamed and its draft name.
     pub renaming: Option<(Renaming, String)>,
     /// An edit waiting for the user to accept the links it breaks.
@@ -792,6 +1060,39 @@ pub enum GraphMsg {
     /// Opens the value picker for a step input.
     Pick(Port),
     PickSearch(String),
+    /// Shows only the values that fit the input, or all of them.
+    PickCompatible(bool),
+    /// The pointer entered a card (`Some`) or left it (`None`).
+    Hover(Option<NodeId>),
+    /// A card's header was pressed: dragging it starts.
+    DragStart(NodeId),
+    /// The pointer was released over this card: the dragged card moves to
+    /// its place, asking first when that breaks links.
+    DragDrop(NodeId),
+    /// Moves a node to another node's place without asking.
+    MoveToNow(NodeId, NodeId),
+    /// The pointer left this card.
+    HoverEnd(NodeId),
+    /// Opens the editor of a composite node.
+    CompositeEdit(NodeId),
+    CompositeDraftName(String),
+    CompositeDraftDescription(String),
+    /// A new name for the input at this place.
+    CompositeDraftInput(usize, String),
+    /// A new default for the input at this place.
+    CompositeDraftDefault(usize, String),
+    CompositeDraftOutput(usize, String),
+    CompositeEditSave,
+    CompositeEditCancel,
+    /// Writes the composite library to a file the user picks.
+    LibraryExport,
+    /// Adds the composites of a library file the user picks.
+    LibraryImport,
+    LibraryImported(Option<Vec<u8>>),
+    /// The library was written to this file, or failed to be.
+    LibraryExported(Option<Result<String, String>>),
+    /// The pointer was released away from every card.
+    DragCancel,
     PickCancel,
     /// The picker chose this output for the input being picked.
     Choose(Port),
@@ -804,6 +1105,9 @@ pub enum GraphMsg {
     Commit(Port),
     /// A slider or toggle set an input value.
     Set(Port, Value),
+    /// Text pasted into a table's paste box: rows of tab-, semicolon- or
+    /// comma-separated cells replace the table.
+    TablePaste(Port, String),
     /// Start an empty graph; the drawing keeps the old graph's objects.
     New,
     Save,
@@ -1474,6 +1778,178 @@ impl Graph {
         }
     }
 
+    /// The editor's starting point for composite node `id`.
+    fn composite_draft(&self, id: NodeId) -> Option<CompositeDraft> {
+        let node = self.engine.node(id)?;
+        let Kind::Composite(composite) = &node.kind else {
+            return None;
+        };
+        Some(CompositeDraft {
+            node: id,
+            name: composite.name.clone(),
+            description: composite_description(composite).to_owned(),
+            inputs: composite
+                .inputs
+                .iter()
+                .map(|(name, port)| {
+                    let default = display(&composite.graph.input(port));
+                    (name.clone(), name.clone(), default)
+                })
+                .collect(),
+            outputs: composite
+                .outputs
+                .iter()
+                .map(|(name, _)| (name.clone(), name.clone()))
+                .collect(),
+        })
+    }
+
+    /// Applies an edited composite to its node: the new name, description
+    /// and defaults, and ports renamed together with the links on them.
+    /// A blank or repeated port name keeps the old one.
+    fn apply_composite_draft(&mut self, draft: CompositeDraft) {
+        let id = draft.node;
+        let Some(Kind::Composite(composite)) = self.engine.node(id).map(|node| node.kind.clone())
+        else {
+            return;
+        };
+        let mut composite = (*composite).clone();
+        let renames = |ports: &mut Vec<(String, Port)>, wanted: Vec<(String, String)>| {
+            let mut taken: HashSet<String> = HashSet::default();
+            let mut changed = Vec::new();
+            for ((name, _), (old, new)) in ports.iter_mut().zip(wanted) {
+                let new = new.trim().to_owned();
+                let name_now = if new.is_empty() || taken.contains(&new.to_lowercase()) {
+                    old.clone()
+                } else {
+                    new
+                };
+                taken.insert(name_now.to_lowercase());
+                if name_now != old {
+                    changed.push((old, name_now.clone()));
+                }
+                *name = name_now;
+            }
+            changed
+        };
+        let input_renames = renames(
+            &mut composite.inputs,
+            draft
+                .inputs
+                .iter()
+                .map(|(old, new, _)| (old.clone(), new.clone()))
+                .collect(),
+        );
+        let output_renames = renames(
+            &mut composite.outputs,
+            draft
+                .outputs
+                .iter()
+                .map(|(old, new)| (old.clone(), new.clone()))
+                .collect(),
+        );
+        // Defaults are the inner values the exposed inputs start from.
+        let mut defaults = Vec::new();
+        for ((name, port), (_, _, text)) in composite.inputs.clone().iter().zip(&draft.inputs) {
+            let current = display(&composite.graph.input(port));
+            if *text == current {
+                continue;
+            }
+            let value = text
+                .trim()
+                .parse::<f64>()
+                .map_or_else(|_| Value::String(text.clone()), graph::value::number);
+            if let Some(inner) = composite.graph.node_mut(port.node) {
+                inner.params.insert(port.field.clone(), value.clone());
+            }
+            defaults.push((name.clone(), value));
+        }
+        if !draft.name.trim().is_empty() {
+            composite.name = draft.name.trim().to_owned();
+        }
+        if !composite.meta.is_object() {
+            composite.meta = json!({});
+        }
+        composite.meta["description"] = Value::String(draft.description.trim().to_owned());
+        for link in &mut self.engine.links {
+            if link.to.node == id {
+                if let Some((_, new)) = input_renames.iter().find(|(old, _)| *old == link.to.field)
+                {
+                    link.to.field = new.clone();
+                }
+            }
+            if link.from.node == id {
+                if let Some((_, new)) = output_renames
+                    .iter()
+                    .find(|(old, _)| *old == link.from.field)
+                {
+                    link.from.field = new.clone();
+                }
+            }
+        }
+        if let Some(node) = self.engine.node_mut(id) {
+            for (old, new) in &input_renames {
+                if let Some(value) = node.params.remove(old) {
+                    node.params.insert(new.clone(), value);
+                }
+            }
+            for (name, value) in defaults {
+                node.params.insert(name, value);
+            }
+            node.kind = Kind::Composite(Arc::new(composite));
+        }
+    }
+
+    /// Whether `id` can be dropped on `target`: another node of its area.
+    fn can_move_to(&self, id: NodeId, target: NodeId) -> bool {
+        let input = |id: NodeId| self.engine.node(id).map(|node| is_input(&node.kind));
+        id != target && input(id).is_some() && input(id) == input(target)
+    }
+
+    /// The node order with `id` moved to `target`'s place: after it when
+    /// moving later, before it when moving earlier.
+    fn order_moved_to(&self, id: NodeId, target: NodeId) -> Option<Vec<usize>> {
+        let from = self.engine.nodes.iter().position(|node| node.id == id)?;
+        let to = self
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.id == target)?;
+        let mut order: Vec<usize> = (0..self.engine.nodes.len()).collect();
+        let moved = order.remove(from);
+        order.insert(to, moved);
+        Some(order)
+    }
+
+    /// Links dropping `id` on `target` would break.
+    fn move_to_breaks(&self, id: NodeId, target: NodeId) -> Vec<Link> {
+        let Some(order) = self.order_moved_to(id, target) else {
+            return Vec::new();
+        };
+        let nodes = &self.engine.nodes;
+        self.broken_links(&Self::ranks(
+            order.iter().map(|&k| (nodes[k].id, &nodes[k].kind)),
+        ))
+    }
+
+    /// Moves `id` to `target`'s place, into `target`'s group.
+    fn move_to(&mut self, id: NodeId, target: NodeId) {
+        let Some(order) = self.order_moved_to(id, target) else {
+            return;
+        };
+        let mut nodes: Vec<Option<graph::Node>> = std::mem::take(&mut self.engine.nodes)
+            .into_iter()
+            .map(Some)
+            .collect();
+        self.engine.nodes = order.iter().filter_map(|&k| nodes[k].take()).collect();
+        let group = self.node_group(target);
+        if let Some(ui) = self.ui.get_mut(&id) {
+            ui.group = group;
+        }
+        self.prune_links();
+        self.prune_groups();
+    }
+
     /// Whether `id` can move that way at all.
     fn can_move(&self, id: NodeId, direction: i32) -> bool {
         self.plan_move(id, direction).is_some()
@@ -1732,6 +2208,8 @@ impl Graph {
                         step: param("step").unwrap_or(0.0),
                     },
                     ("Boolean", "value") => RowWidget::Toggle,
+                    ("Table", "table") => RowWidget::Table,
+                    ("Table", "header") => RowWidget::Toggle,
                     _ => RowWidget::Field,
                 };
                 let output = spec.outputs.contains(&input.name);
@@ -1750,13 +2228,38 @@ impl Graph {
                 }
             })
             .collect();
+        // A table's columns take the names its first row gives them.
+        let headers: Vec<String> = match spec.name {
+            "Table"
+                if graph::value::boolean(&self.engine.input(&Port {
+                    node: id,
+                    field: "header".to_owned(),
+                }))
+                .unwrap_or(true) =>
+            {
+                graph::value::table(&self.engine.input(&Port {
+                    node: id,
+                    field: "table".to_owned(),
+                }))
+                .first()
+                .map(|row| row.iter().map(graph::value::text).collect())
+                .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
         rows.extend(
             spec.outputs
                 .iter()
                 .filter(|name| !spec.inputs.iter().any(|input| input.name == **name))
                 .map(|name| NodeRow {
                     field: (*name).to_owned(),
-                    label: (*name).to_owned(),
+                    label: name
+                        .strip_prefix("column ")
+                        .and_then(|k| k.parse::<usize>().ok())
+                        .and_then(|k| headers.get(k - 1))
+                        .filter(|header| !header.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| (*name).to_owned()),
                     value: node.outputs.get(*name).cloned().unwrap_or(Value::Null),
                     input: false,
                     output: true,
@@ -1879,6 +2382,8 @@ impl Graph {
             None
         } else if let Some(confirm) = &self.confirm {
             Some(self.confirm_dialog(confirm, &sections))
+        } else if let Some(draft) = &self.editing {
+            Some(self.composite_editor(draft))
         } else {
             self.picking
                 .as_ref()
@@ -2128,11 +2633,48 @@ impl Graph {
                 )),
                 ..Default::default()
             });
+        // A drag released away from every card goes nowhere.
+        let backdrop: Element<'_, Message> = if self.dragging.is_some() {
+            mouse_area(backdrop)
+                .on_release(msg(GraphMsg::DragCancel))
+                .interaction(mouse::Interaction::Grabbing)
+                .into()
+        } else {
+            backdrop.into()
+        };
         let mut layers = stack![backdrop];
         if let Some(overlay) = overlay {
             layers = layers.push(overlay);
         }
         opaque(layers.width(Length::Fill).height(Length::Fill))
+    }
+
+    /// A card that highlights its geometry in the drawing while the pointer
+    /// is over it, and takes a dragged card dropped on it, edged in the
+    /// accent while one is.
+    fn hover_target<'a>(&self, id: NodeId, card: Element<'a, Message>) -> Element<'a, Message> {
+        let target = self.dragging.is_some_and(|dragged| dragged != id) && self.hovered == Some(id);
+        let framed = container(card).padding(2).style(move |theme: &Theme| {
+            if !target {
+                return container::Style::default();
+            }
+            container::Style {
+                border: Border {
+                    color: theme.palette().primary.base.color,
+                    width: 2.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+        let area = mouse_area(framed)
+            .on_enter(msg(GraphMsg::Hover(Some(id))))
+            .on_exit(msg(GraphMsg::HoverEnd(id)));
+        if self.dragging.is_some() {
+            area.on_release(msg(GraphMsg::DragDrop(id))).into()
+        } else {
+            area.into()
+        }
     }
 
     /// Splits nodes into runs of consecutive members of one group (or of
@@ -2320,6 +2862,11 @@ impl Graph {
         }
         if matches!(node.kind, Kind::Composite(_)) {
             header = header.push(icon_button(
+                crate::ui::icons::MENU,
+                "Edit composite",
+                Some(GraphMsg::CompositeEdit(id)),
+            ));
+            header = header.push(icon_button(
                 crate::ui::icons::SPLIT_H,
                 "Expand into its nodes",
                 Some(GraphMsg::ExpandComposite(id)),
@@ -2340,11 +2887,20 @@ impl Graph {
             "Delete node",
             Some(GraphMsg::NodeDelete(id)),
         ));
-        container(header)
-            .padding([5, 6])
-            .width(Length::Fill)
-            .style(header_style)
-            .into()
+        // The header is the handle a card is dragged by.
+        mouse_area(
+            container(header)
+                .padding([5, 6])
+                .width(Length::Fill)
+                .style(header_style),
+        )
+        .on_press(msg(GraphMsg::DragStart(id)))
+        .interaction(if self.dragging == Some(id) {
+            mouse::Interaction::Grabbing
+        } else {
+            mouse::Interaction::Grab
+        })
+        .into()
     }
 
     /// The group list at the foot of a card.
@@ -2381,9 +2937,11 @@ impl Graph {
     /// A card's frame, edged in its node's colour.
     fn card<'a>(
         id: NodeId,
+        warn: bool,
         content: impl Into<Element<'a, Message>>,
     ) -> container::Container<'a, Message> {
-        let color = node_color(id);
+        // A node with issues is edged in amber instead of its colour.
+        let color = if warn { ISSUE_COLOR } else { node_color(id) };
         container(content).style(move |theme: &Theme| {
             let mut style = card_style(theme);
             style.border.color = color.scale_alpha(0.8);
@@ -2429,9 +2987,12 @@ impl Graph {
             .spacing(4)
             .align_y(iced::Center),
         );
-        Self::card(id, column![self.header(node, None, extra), body])
-            .width(Length::Fill)
-            .into()
+        self.hover_target(
+            id,
+            Self::card(id, false, column![self.header(node, None, extra), body])
+                .width(Length::Fill)
+                .into(),
+        )
     }
 
     /// One hand-typed value of an input node.
@@ -2476,6 +3037,7 @@ impl Graph {
                     .width(Length::Fill)
                     .into()
             }
+            RowWidget::Table => return table_editor(port, &node_row.value),
         };
         row![
             text(t!(node_row.label.as_str()).into_owned())
@@ -2514,6 +3076,30 @@ impl Graph {
             ),
         ];
         let mut body = column![].spacing(2).padding([4, 6]);
+        if !node.issues.is_empty() {
+            let mut issues = column![].spacing(2);
+            for issue in &node.issues {
+                issues = issues.push(
+                    row![
+                        crate::ui::icons::themed(crate::ui::icons::WARNING, 10.0),
+                        text(issue_text(issue)).size(10),
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                );
+            }
+            body = body.push(container(issues).padding([3, 6]).width(Length::Fill).style(
+                |_: &Theme| container::Style {
+                    background: Some(Background::Color(ISSUE_COLOR.scale_alpha(0.15))),
+                    border: Border {
+                        color: ISSUE_COLOR,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                },
+            ));
+        }
         if sections.is_empty() {
             body = body.push(
                 container(text(t!("Object deleted")).size(11).style(weak_text)).padding([2, 2]),
@@ -2583,10 +3169,14 @@ impl Graph {
                             ]
                             .spacing(2)
                             .width(LABEL_W),
-                            text(display(&node_row.value))
-                                .size(11)
-                                .style(weak_text)
-                                .width(Length::Fill),
+                            with_list_preview(
+                                text(display(&node_row.value))
+                                    .size(11)
+                                    .style(weak_text)
+                                    .width(Length::Fill)
+                                    .into(),
+                                list_preview(&node_row.value),
+                            ),
                         ]
                         .spacing(4)
                         .padding([3, 4])
@@ -2601,9 +3191,16 @@ impl Graph {
                 .padding([4, 2])
                 .align_y(iced::Center),
         );
-        Self::card(id, column![self.header(node, Some(step), extra), body])
+        self.hover_target(
+            id,
+            Self::card(
+                id,
+                !node.issues.is_empty(),
+                column![self.header(node, Some(step), extra), body],
+            )
             .width(NODE_W)
-            .into()
+            .into(),
+        )
     }
 
     fn step_row(
@@ -2631,7 +3228,10 @@ impl Graph {
                 badge(node_color(from), None),
                 column![
                     text(source).size(11),
-                    text(format!("= {shown}")).size(10).style(weak_text),
+                    with_list_preview(
+                        text(format!("= {shown}")).size(10).style(weak_text).into(),
+                        list_preview(&node_row.value),
+                    ),
                 ]
                 .spacing(1)
             ]
@@ -2719,6 +3319,7 @@ impl Graph {
             computed: bool,
             fits: bool,
             kind: PortType,
+            tip: Option<String>,
         }
         struct Group {
             id: NodeId,
@@ -2759,10 +3360,12 @@ impl Graph {
                     computed: !row.input,
                     fits: expect.fits(&row.value),
                     kind: shown_type(row.kind, &row.value),
+                    tip: list_preview(&row.value),
                 })
                 .filter(|entry| {
                     query.is_empty() || name_match || entry.label.to_lowercase().contains(&query)
                 })
+                .filter(|entry| !self.pick_compatible || entry.fits)
                 .collect();
             if !entries.is_empty() {
                 groups.push(Group {
@@ -2828,10 +3431,14 @@ impl Graph {
                     button(
                         row![
                             container(label_row).width(Length::FillPortion(2)),
-                            text(entry.value)
-                                .size(11)
-                                .style(weak_text)
-                                .width(Length::FillPortion(3)),
+                            with_list_preview(
+                                text(entry.value)
+                                    .size(11)
+                                    .style(weak_text)
+                                    .width(Length::FillPortion(3))
+                                    .into(),
+                                entry.tip,
+                            ),
                         ]
                         .spacing(6)
                         .align_y(iced::Center),
@@ -2989,11 +3596,20 @@ impl Graph {
                 ]
                 .spacing(8)
                 .align_y(iced::Center),
-                text_input(&t!("Search values…"), &self.pick_search)
-                    .id(iced::widget::Id::new(PICK_SEARCH_ID))
-                    .on_input(|value| msg(GraphMsg::PickSearch(value)))
-                    .padding([4, 8])
-                    .size(12),
+                row![
+                    text_input(&t!("Search values…"), &self.pick_search)
+                        .id(iced::widget::Id::new(PICK_SEARCH_ID))
+                        .on_input(|value| msg(GraphMsg::PickSearch(value)))
+                        .padding([4, 8])
+                        .size(12),
+                    checkbox(self.pick_compatible)
+                        .label(t!("Only values that fit").into_owned())
+                        .on_toggle(|on| msg(GraphMsg::PickCompatible(on)))
+                        .size(14)
+                        .text_size(11),
+                ]
+                .spacing(10)
+                .align_y(iced::Center),
                 list,
                 actions,
             ]
@@ -3003,6 +3619,91 @@ impl Graph {
         .width(PICKER_TWO_W)
         .style(card_style);
         modal(card.into(), GraphMsg::PickCancel)
+    }
+
+    /// The composite editor: the composite's name and description, and a
+    /// name and default per input and a name per output.
+    fn composite_editor(&self, draft: &CompositeDraft) -> Element<'_, Message> {
+        let field = |value: &str, on: Box<dyn Fn(String) -> GraphMsg>| {
+            text_input("", value)
+                .on_input(move |text| msg(on(text)))
+                .size(11)
+                .padding([3, 6])
+                .width(Length::Fill)
+        };
+        let mut inputs = column![row![
+            text(t!("Input"))
+                .size(10)
+                .style(weak_text)
+                .width(Length::FillPortion(3)),
+            text(t!("Default"))
+                .size(10)
+                .style(weak_text)
+                .width(Length::FillPortion(2)),
+        ]
+        .spacing(6)]
+        .spacing(4);
+        for (k, (_, name, default)) in draft.inputs.iter().enumerate() {
+            inputs = inputs.push(
+                row![
+                    container(field(
+                        name,
+                        Box::new(move |text| GraphMsg::CompositeDraftInput(k, text))
+                    ))
+                    .width(Length::FillPortion(3)),
+                    container(field(
+                        default,
+                        Box::new(move |text| GraphMsg::CompositeDraftDefault(k, text))
+                    ))
+                    .width(Length::FillPortion(2)),
+                ]
+                .spacing(6),
+            );
+        }
+        let mut outputs = column![text(t!("Output")).size(10).style(weak_text)].spacing(4);
+        for (k, (_, name)) in draft.outputs.iter().enumerate() {
+            outputs = outputs.push(field(
+                name,
+                Box::new(move |text| GraphMsg::CompositeDraftOutput(k, text)),
+            ));
+        }
+        let card = container(
+            column![
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::MENU, 16.0),
+                    text(t!("Edit composite")).size(13)
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                text(t!("Name")).size(10).style(weak_text),
+                field(&draft.name, Box::new(GraphMsg::CompositeDraftName)),
+                text(t!("Description")).size(10).style(weak_text),
+                field(&draft.description, Box::new(GraphMsg::CompositeDraftDescription)),
+                scrollable(column![inputs, outputs].spacing(12)).height(Length::Shrink),
+                text(t!(
+                    "Links follow renamed ports. Save the composite to the library to keep the changes for other drawings."
+                ))
+                .size(10)
+                .style(weak_text),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text(t!("Cancel")).size(11))
+                        .on_press(msg(GraphMsg::CompositeEditCancel))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    button(text(t!("Apply")).size(11))
+                        .on_press(msg(GraphMsg::CompositeEditSave))
+                        .style(button::primary)
+                        .padding([4, 10]),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(PICKER_W)
+        .style(card_style);
+        modal(card.into(), GraphMsg::CompositeEditCancel)
     }
 
     /// Asks before an edit drops links, naming each one.
@@ -3189,7 +3890,9 @@ impl Graph {
                     .collect()
             };
             let items: Vec<PaletteItem> = items.into_iter().filter(|item| wanted(*item)).collect();
-            if items.is_empty() {
+            // Composites stays, empty, for its import button.
+            let library = category == "Composites";
+            if items.is_empty() && !(library && query.is_empty()) {
                 continue;
             }
             // A search shows every match, collapsed categories included.
@@ -3227,6 +3930,25 @@ impl Graph {
                 })
                 .width(Length::Fill)
                 .padding([3, 6]);
+            let heading: Element<'_, Message> = if library {
+                row![
+                    heading,
+                    icon_button(
+                        crate::ui::icons::FILE_EXPORT,
+                        "Export the composite library",
+                        (!composite_library().is_empty()).then_some(GraphMsg::LibraryExport)
+                    ),
+                    icon_button(
+                        crate::ui::icons::FOLDER_OPEN,
+                        "Import composites",
+                        Some(GraphMsg::LibraryImport)
+                    ),
+                ]
+                .align_y(iced::Center)
+                .into()
+            } else {
+                heading.into()
+            };
             tree = tree.push(if draws {
                 Element::from(
                     tooltip(
@@ -3376,6 +4098,82 @@ impl Graph {
                 self.pick_search.clear();
             }
             GraphMsg::PickSearch(value) => self.pick_search = value.clone(),
+            GraphMsg::PickCompatible(on) => self.pick_compatible = *on,
+            GraphMsg::Hover(id) => self.hovered = *id,
+            GraphMsg::HoverEnd(id) => {
+                if self.hovered == Some(*id) {
+                    self.hovered = None;
+                }
+            }
+            GraphMsg::DragCancel => self.dragging = None,
+            GraphMsg::CompositeEdit(id) => self.editing = self.composite_draft(*id),
+            GraphMsg::CompositeDraftName(name) => {
+                if let Some(draft) = &mut self.editing {
+                    draft.name = name.clone();
+                }
+            }
+            GraphMsg::CompositeDraftDescription(text) => {
+                if let Some(draft) = &mut self.editing {
+                    draft.description = text.clone();
+                }
+            }
+            GraphMsg::CompositeDraftInput(k, name) => {
+                if let Some(entry) = self
+                    .editing
+                    .as_mut()
+                    .and_then(|draft| draft.inputs.get_mut(*k))
+                {
+                    entry.1 = name.clone();
+                }
+            }
+            GraphMsg::CompositeDraftDefault(k, value) => {
+                if let Some(entry) = self
+                    .editing
+                    .as_mut()
+                    .and_then(|draft| draft.inputs.get_mut(*k))
+                {
+                    entry.2 = value.clone();
+                }
+            }
+            GraphMsg::CompositeDraftOutput(k, name) => {
+                if let Some(entry) = self
+                    .editing
+                    .as_mut()
+                    .and_then(|draft| draft.outputs.get_mut(*k))
+                {
+                    entry.1 = name.clone();
+                }
+            }
+            GraphMsg::CompositeEditCancel => self.editing = None,
+            GraphMsg::CompositeEditSave => {
+                if let Some(draft) = self.editing.take() {
+                    self.record();
+                    self.apply_composite_draft(draft);
+                }
+            }
+            GraphMsg::DragStart(id) => self.dragging = Some(*id),
+            GraphMsg::DragDrop(target) => {
+                if let Some(id) = self.dragging.take() {
+                    if self.can_move_to(id, *target) {
+                        let links = self.move_to_breaks(id, *target);
+                        if links.is_empty() {
+                            self.record();
+                            self.move_to(id, *target);
+                        } else {
+                            self.confirm = Some(Confirm {
+                                action: GraphMsg::MoveToNow(id, *target),
+                                node: id,
+                                delete: false,
+                                links,
+                            });
+                        }
+                    }
+                }
+            }
+            GraphMsg::MoveToNow(id, target) => {
+                self.record();
+                self.move_to(*id, *target);
+            }
             GraphMsg::PickCancel => self.picking = None,
             GraphMsg::Choose(from) => {
                 if let Some(to) = self.picking.take() {
@@ -3849,6 +4647,140 @@ mod tests {
     fn link(graph: &mut Graph, from: Port, to: Port) {
         graph.update_ui(&GraphMsg::Pick(to));
         graph.update_ui(&GraphMsg::Choose(from));
+    }
+
+    #[test]
+    fn a_dragged_card_drops_into_place_asking_when_it_breaks_links() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let first = graph.add_node(op("Add"), Vec::new());
+        let second = graph.add_node(op("Negate"), Vec::new());
+        let third = graph.add_node(op("Pi"), Vec::new());
+        link(&mut graph, port(input, "value"), port(first, "a"));
+        link(&mut graph, port(first, "result"), port(second, "x"));
+
+        // Pi has no links: dropped on Add it takes its place at once.
+        graph.update_ui(&GraphMsg::DragStart(third));
+        graph.update_ui(&GraphMsg::DragDrop(first));
+        assert!(graph.confirm.is_none());
+        assert_eq!((graph.steps()[&third], graph.steps()[&first]), (0, 1));
+        assert!(graph.dragging.is_none());
+
+        // Negate before Add would read a later step: it asks first.
+        graph.update_ui(&GraphMsg::DragStart(second));
+        graph.update_ui(&GraphMsg::DragDrop(first));
+        let confirm = graph.confirm.clone().expect("the drop asks");
+        assert_eq!(confirm.links.len(), 1);
+        graph.confirm = None;
+        graph.update_ui(&confirm.action);
+        assert_eq!(graph.steps()[&second], 1);
+        assert!(!graph.engine.is_linked(&port(second, "x")));
+
+        // An input never drops among the steps.
+        graph.update_ui(&GraphMsg::DragStart(input));
+        graph.update_ui(&GraphMsg::DragDrop(first));
+        assert!(graph.confirm.is_none());
+        assert!(is_input(&graph.engine.nodes[0].kind));
+        graph.update_ui(&GraphMsg::Undo);
+        assert_eq!(graph.steps()[&second], 2);
+    }
+
+    #[test]
+    fn a_composite_edit_renames_ports_with_their_links() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let add = graph.add_node(op("Add"), Vec::new());
+        let negate = graph.add_node(op("Negate"), Vec::new());
+        let after = graph.add_node(op("Absolute"), Vec::new());
+        link(&mut graph, port(input, "value"), port(add, "a"));
+        link(&mut graph, port(add, "result"), port(negate, "x"));
+        link(&mut graph, port(negate, "result"), port(after, "x"));
+        graph.update_ui(&GraphMsg::GroupNew(add));
+        let group = graph.node_group(add).unwrap();
+        graph.update_ui(&GraphMsg::GroupAssign(negate, Some(group)));
+        let id = graph.make_composite(group).unwrap();
+
+        graph.update_ui(&GraphMsg::CompositeEdit(id));
+        let draft = graph.editing.clone().expect("the editor opens");
+        assert_eq!(draft.inputs.len(), 1);
+        let old_output = draft.outputs[0].0.clone();
+        graph.update_ui(&GraphMsg::CompositeDraftName("Opposite".into()));
+        graph.update_ui(&GraphMsg::CompositeDraftDescription(
+            "Minus a plus one".into(),
+        ));
+        graph.update_ui(&GraphMsg::CompositeDraftInput(0, "Amount".into()));
+        graph.update_ui(&GraphMsg::CompositeDraftOutput(0, "Opposite".into()));
+        graph.update_ui(&GraphMsg::CompositeEditSave);
+        assert!(graph.editing.is_none());
+
+        let Kind::Composite(composite) = &graph.engine.node(id).unwrap().kind else {
+            panic!("still a composite");
+        };
+        assert_eq!(composite.name, "Opposite");
+        assert_eq!(composite_description(composite), "Minus a plus one");
+        assert!(graph.engine.is_linked(&port(id, "Amount")));
+        assert!(graph
+            .engine
+            .links
+            .iter()
+            .any(|link| link.from == port(id, "Opposite") && link.to == port(after, "x")));
+        assert!(describe(&graph.engine.node(id).unwrap().kind).starts_with("Minus a plus one"));
+        graph.update_ui(&GraphMsg::Undo);
+        assert!(graph
+            .engine
+            .links
+            .iter()
+            .any(|link| link.from == port(id, &old_output)));
+    }
+
+    #[test]
+    fn tables_edit_as_cells_and_lists_preview_their_items() {
+        let cells = table_cells(&Value::Null);
+        assert_eq!(
+            cells,
+            vec![
+                vec!["A".to_owned(), "B".to_owned()],
+                vec![String::new(), String::new()]
+            ]
+        );
+        let pasted = table_cells(&Value::String("at\twidth\n2\t0.9\n6".into()));
+        assert_eq!(
+            pasted,
+            vec![
+                vec!["at".to_owned(), "width".to_owned()],
+                vec!["2".to_owned(), "0.9".to_owned()],
+                vec!["6".to_owned(), String::new()],
+            ]
+        );
+        let mut graph = Graph::default();
+        let table = graph.add_node(op("Table"), Vec::new());
+        assert!(is_input(&graph.engine.node(table).unwrap().kind));
+        // The app writes a Set value; the canvas only records the undo step.
+        graph
+            .engine
+            .node_mut(table)
+            .unwrap()
+            .params
+            .insert("table".into(), table_value(&pasted));
+        let sections = graph.sections(HashMap::default());
+        let index = graph
+            .engine
+            .nodes
+            .iter()
+            .position(|node| node.id == table)
+            .unwrap();
+        let labels: Vec<&str> = sections[index][0]
+            .rows
+            .iter()
+            .map(|row| row.label.as_str())
+            .collect();
+        assert!(
+            labels.contains(&"at") && labels.contains(&"width"),
+            "{labels:?}"
+        );
+        assert_eq!(list_preview(&json!(1)), None);
+        let preview = list_preview(&json!([1, 2, 3])).unwrap();
+        assert!(preview.ends_with("2: 3"), "{preview}");
     }
 
     #[test]
