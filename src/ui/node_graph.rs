@@ -37,6 +37,8 @@ pub const NODE_W: f32 = 300.0;
 const INPUTS_W: f32 = 290.0;
 const LABEL_W: f32 = 96.0;
 const PICKER_W: f32 = 440.0;
+/// The value picker: inputs on the left, earlier steps on the right.
+const PICKER_TWO_W: f32 = 780.0;
 const ZOOM_STEP: f32 = 1.15;
 const ZOOM_STEPS: std::ops::RangeInclusive<i32> = -8..=8;
 /// The `NodeUi::open` key of a step's computed-values group; no section
@@ -2774,17 +2776,13 @@ impl Graph {
             }
         }
 
-        let mut list = column![].spacing(8);
-        if groups.is_empty() {
-            list = list.push(
-                text(t!(
-                    "No values to choose from. Add inputs, or steps earlier in the node sequence."
-                ))
-                .size(11)
-                .style(weak_text),
-            );
-        }
+        // Inputs on the left, earlier steps on the right, each scrolling on
+        // its own.
+        let mut input_list = column![].spacing(8);
+        let mut step_list = column![].spacing(8);
+        let (mut input_count, mut step_count) = (0, 0);
         for group in groups {
+            let is_step = group.step.is_some();
             let color = node_color(group.id);
             let tag =
                 container(text(group.tag).size(10))
@@ -2857,8 +2855,10 @@ impl Graph {
                     }),
                 );
             }
-            list = list.push(container(entries).padding(4).width(Length::Fill).style(
-                move |_: &Theme| container::Style {
+            let card = container(entries)
+                .padding(4)
+                .width(Length::Fill)
+                .style(move |_: &Theme| container::Style {
                     background: Some(Background::Color(color.scale_alpha(0.08))),
                     border: Border {
                         color: color.scale_alpha(0.6),
@@ -2866,9 +2866,63 @@ impl Graph {
                         radius: 6.0.into(),
                     },
                     ..Default::default()
-                },
-            ));
+                });
+            if is_step {
+                step_list = step_list.push(card);
+                step_count += 1;
+            } else {
+                input_list = input_list.push(card);
+                input_count += 1;
+            }
         }
+        let pane = |title: String,
+                    count: usize,
+                    list: iced::widget::Column<'static, Message>,
+                    empty: &str| {
+            let list = if count == 0 {
+                list.push(text(t!(empty).into_owned()).size(11).style(weak_text))
+            } else {
+                list
+            };
+            column![
+                row![
+                    text(title).size(12).width(Length::Fill),
+                    text(count.to_string()).size(10).style(weak_text),
+                ]
+                .align_y(iced::Center)
+                .padding([0, 4]),
+                scrollable(container(list).padding(iced::Padding {
+                    top: 0.0,
+                    right: 10.0,
+                    bottom: 0.0,
+                    left: 0.0,
+                }))
+                .height(Length::Fixed(380.0)),
+            ]
+            .spacing(6)
+            .width(Length::FillPortion(1))
+        };
+        let list = row![
+            pane(
+                t!("Inputs").into_owned(),
+                input_count,
+                input_list,
+                "No inputs yet. New input with this value adds one."
+            ),
+            container(Space::new().width(1.0).height(Length::Fixed(400.0))).style(
+                |theme: &Theme| container::Style {
+                    background: Some(Background::Color(theme.palette().background.strong.color)),
+                    ..Default::default()
+                }
+            ),
+            pane(
+                t!("Node Sequence").into_owned(),
+                step_count,
+                step_list,
+                "No earlier steps. Only steps before this one can feed it."
+            ),
+        ]
+        .spacing(10);
 
         let mut title = column![
             text(t!("Select value")).size(13),
@@ -2940,19 +2994,13 @@ impl Graph {
                     .on_input(|value| msg(GraphMsg::PickSearch(value)))
                     .padding([4, 8])
                     .size(12),
-                scrollable(container(list).padding(iced::Padding {
-                    top: 0.0,
-                    right: 10.0,
-                    bottom: 0.0,
-                    left: 0.0,
-                }))
-                .height(Length::Fixed(380.0)),
+                list,
                 actions,
             ]
             .spacing(8),
         )
         .padding(12)
-        .width(PICKER_W)
+        .width(PICKER_TWO_W)
         .style(card_style);
         modal(card.into(), GraphMsg::PickCancel)
     }

@@ -1703,6 +1703,108 @@ mod tests {
         assert_eq!(labels[7], json!("0+200.00"));
     }
 
+    /// The guide's wall: an axis cut at a door and a window, each stretch
+    /// outlined at the wall's thickness, a door leaf and swing, a window.
+    #[test]
+    fn a_wall_with_a_door_and_a_window() {
+        let mut app = app();
+        let built = apply_changes(
+            &mut app,
+            "wall",
+            json!([
+                {"add": "Number", "name": "Largo", "values": {"value": 10}},
+                {"add": "Number", "name": "Espesor", "values": {"value": 0.2}},
+                {"add": "Number", "name": "Puerta en", "values": {"value": 2}},
+                {"add": "Number", "name": "Ancho puerta", "values": {"value": 0.9}},
+                {"add": "Number", "name": "Ventana en", "values": {"value": 6}},
+                {"add": "Number", "name": "Ancho ventana", "values": {"value": 1.5}},
+                {"add": "Number", "name": "Apertura", "values": {"value": 90}},
+                {"add": "Point", "source": "builtin", "name": "Inicio"},
+                {"add": "Point", "source": "builtin", "name": "Fin"},
+                {"link": "Largo.value", "to": "Fin.x"},
+                {"add": "Line Curve", "name": "Eje"},
+                {"link": "Inicio.point", "to": "Eje.start"},
+                {"link": "Fin.point", "to": "Eje.end"},
+                {"add": "Add", "name": "Fin puerta"},
+                {"link": "Puerta en.value", "to": "Fin puerta.a"},
+                {"link": "Ancho puerta.value", "to": "Fin puerta.b"},
+                {"add": "Add", "name": "Fin ventana"},
+                {"link": "Ventana en.value", "to": "Fin ventana.a"},
+                {"link": "Ancho ventana.value", "to": "Fin ventana.b"},
+                {"add": "Create List", "name": "Cortes"},
+                {"link": "Puerta en.value", "to": "Cortes.item 0"},
+                {"link": "Fin puerta.result", "to": "Cortes.item 1"},
+                {"link": "Ventana en.value", "to": "Cortes.item 2"},
+                {"link": "Fin ventana.result", "to": "Cortes.item 3"},
+                {"add": "Split At Distances", "name": "Tramos"},
+                {"link": "Eje.curve", "to": "Tramos.curve"},
+                {"link": "Cortes.list", "to": "Tramos.distances"},
+                {"add": "Offset Both Sides", "name": "Muro"},
+                {"link": "Tramos.even", "to": "Muro.curve"},
+                {"link": "Espesor.value", "to": "Muro.width"},
+                {"add": "Draw Geometry", "name": "Dibujar muro"},
+                {"link": "Muro.outline", "to": "Dibujar muro.geometry"},
+                {"add": "Sub Curve", "name": "Vano ventana"},
+                {"link": "Eje.curve", "to": "Vano ventana.curve"},
+                {"link": "Ventana en.value", "to": "Vano ventana.from"},
+                {"link": "Fin ventana.result", "to": "Vano ventana.to"},
+                {"add": "Offset Both Sides", "name": "Marco ventana"},
+                {"link": "Vano ventana.curve", "to": "Marco ventana.curve"},
+                {"link": "Espesor.value", "to": "Marco ventana.width"},
+                {"add": "Create List", "name": "Ventana"},
+                {"link": "Marco ventana.left", "to": "Ventana.item 0"},
+                {"link": "Vano ventana.curve", "to": "Ventana.item 1"},
+                {"link": "Marco ventana.right", "to": "Ventana.item 2"},
+                {"add": "Draw Geometry", "name": "Dibujar ventana"},
+                {"link": "Ventana.list", "to": "Dibujar ventana.geometry"},
+                {"add": "Frame At Distance", "name": "Bisagra"},
+                {"link": "Eje.curve", "to": "Bisagra.curve"},
+                {"link": "Puerta en.value", "to": "Bisagra.distance"},
+                {"add": "Line By Direction", "name": "Hoja"},
+                {"link": "Bisagra.point", "to": "Hoja.start"},
+                {"link": "Bisagra.perpendicular", "to": "Hoja.direction"},
+                {"link": "Ancho puerta.value", "to": "Hoja.length"},
+                {"add": "Add", "name": "Giro hasta"},
+                {"link": "Bisagra.angle", "to": "Giro hasta.a"},
+                {"link": "Apertura.value", "to": "Giro hasta.b"},
+                {"add": "Arc Curve", "name": "Giro"},
+                {"link": "Bisagra.point", "to": "Giro.center"},
+                {"link": "Ancho puerta.value", "to": "Giro.radius"},
+                {"link": "Bisagra.angle", "to": "Giro.from"},
+                {"link": "Giro hasta.result", "to": "Giro.to"},
+                {"add": "Create List", "name": "Puerta"},
+                {"link": "Hoja.curve", "to": "Puerta.item 0"},
+                {"link": "Giro.curve", "to": "Puerta.item 1"},
+                {"add": "Draw Geometry", "name": "Dibujar puerta"},
+                {"link": "Puerta.list", "to": "Dibujar puerta.geometry"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        assert_eq!(built["result"]["warnings"], json!([]), "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        let entities = |name: &str| {
+            node(&state, "sequence", name)["entities"]
+                .as_array()
+                .map_or(0, Vec::len)
+        };
+        // Three closed stretches, the window's three lines, leaf and swing.
+        assert_eq!(entities("Dibujar muro"), 3);
+        assert_eq!(entities("Dibujar ventana"), 3);
+        assert_eq!(entities("Dibujar puerta"), 2);
+        assert_eq!(count_lines(&mut app, "Arc"), 1);
+        assert_eq!(count_lines(&mut app, "Line"), 4);
+
+        // Moving the window moves its stretches and its lines.
+        let moved = apply_changes(
+            &mut app,
+            "move",
+            json!([{"set": "Ventana en.value", "value": 7}]),
+        );
+        assert_eq!(moved["ok"], true, "{moved}");
+        let query = app.automation_op(r#"{"op":"query","type":"Line","detail":"geometry"}"#);
+        assert!(query.to_string().contains("8.5"), "{query}");
+    }
+
     #[test]
     fn curves_flow_as_values_and_only_the_draw_node_draws() {
         let mut app = app();
