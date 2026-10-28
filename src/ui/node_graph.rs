@@ -432,33 +432,6 @@ pub fn save_to_library(composite: Arc<Composite>) {
     }
 }
 
-/// The library as a file: the same JSON list it is stored as.
-pub fn library_file() -> Vec<u8> {
-    Value::Array(
-        composite_library()
-            .iter()
-            .map(|item| item.to_json())
-            .collect(),
-    )
-    .to_string()
-    .into_bytes()
-}
-
-/// Adds the composites of a library file, replacing those of the same
-/// names; how many it held, or why it is not a library.
-pub fn import_library(bytes: &[u8]) -> Result<usize, String> {
-    let items: Vec<Value> = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    let composites: Vec<Composite> = items
-        .iter()
-        .map(Composite::from_json)
-        .collect::<Result<_, _>>()?;
-    let count = composites.len();
-    for composite in composites {
-        save_to_library(Arc::new(composite));
-    }
-    Ok(count)
-}
-
 /// Drops library entry `k`.
 pub fn forget_library_entry(k: usize) {
     if let Ok(mut items) = library_store().lock() {
@@ -507,41 +480,83 @@ fn write_store(file: &str, body: &str) {
     }
 }
 
-fn script_store() -> &'static std::sync::Mutex<Vec<Arc<Script>>> {
-    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<Script>>>> =
+/// A saved script and what the user knows of it: the package it came in.
+#[derive(Clone)]
+struct ScriptEntry {
+    script: Arc<Script>,
+    package: Value,
+}
+
+fn script_store() -> &'static std::sync::Mutex<Vec<ScriptEntry>> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<ScriptEntry>>> =
         std::sync::OnceLock::new();
     STORE.get_or_init(|| {
         let items = read_store(SCRIPTS_FILE)
             .and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
             .unwrap_or_default()
             .iter()
-            .filter_map(|item| Script::from_json(item).ok())
+            .filter_map(|item| {
+                Some(ScriptEntry {
+                    script: Script::from_json(item).ok()?,
+                    package: item["package"].clone(),
+                })
+            })
             .collect();
         std::sync::Mutex::new(items)
     })
+}
+
+fn persist_scripts(items: &[ScriptEntry]) {
+    let body = Value::Array(
+        items
+            .iter()
+            .map(|entry| {
+                let mut item = entry.script.to_json();
+                if !entry.package.is_null() {
+                    item["package"] = entry.package.clone();
+                }
+                item
+            })
+            .collect(),
+    )
+    .to_string();
+    write_store(SCRIPTS_FILE, &body);
 }
 
 /// The saved scripts, in the order the palette lists them.
 pub fn script_library() -> Vec<Arc<Script>> {
     script_store()
         .lock()
-        .map(|items| items.clone())
+        .map(|items| items.iter().map(|entry| entry.script.clone()).collect())
+        .unwrap_or_default()
+}
+
+/// The package script library entry `k` came in, if any.
+fn script_package(k: usize) -> Value {
+    script_store()
+        .lock()
+        .ok()
+        .and_then(|items| items.get(k).map(|entry| entry.package.clone()))
         .unwrap_or_default()
 }
 
 /// Saves `script` to the library, replacing one of the same name.
 pub fn save_script(script: Arc<Script>) {
+    save_script_from(script, Value::Null);
+}
+
+fn save_script_from(script: Arc<Script>, package: Value) {
     if let Ok(mut items) = script_store().lock() {
         let name = script.name.to_lowercase();
+        let entry = ScriptEntry { script, package };
         match items
             .iter()
-            .position(|item| item.name.to_lowercase() == name)
+            .position(|item| item.script.name.to_lowercase() == name)
         {
-            Some(k) => items[k] = script,
-            None => items.push(script),
+            Some(k) => items[k] = entry,
+            None => items.push(entry),
         }
-        let body = Value::Array(items.iter().map(|item| item.to_json()).collect()).to_string();
-        write_store(SCRIPTS_FILE, &body);
+        persist_scripts(&items);
     }
 }
 
@@ -550,10 +565,240 @@ pub fn forget_script(k: usize) {
     if let Ok(mut items) = script_store().lock() {
         if k < items.len() {
             items.remove(k);
-            let body = Value::Array(items.iter().map(|item| item.to_json()).collect()).to_string();
-            write_store(SCRIPTS_FILE, &body);
+            persist_scripts(&items);
         }
     }
+}
+
+// ── Packages ──────────────────────────────────────────────────────────────
+// A package (`.ocgpack`) shares composites and scripts between users: a
+// JSON file naming its package, author, version and the app it was made
+// with, and holding the entries.
+
+const PACK_FORMAT: &str = "ocgpack";
+
+/// What a package says of itself.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PackMeta {
+    pub name: String,
+    pub author: String,
+    pub version: String,
+    pub description: String,
+}
+
+impl PackMeta {
+    fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "author": self.author,
+            "version": self.version,
+            "description": self.description,
+        })
+    }
+
+    fn from_json(value: &Value) -> Self {
+        let field = |key: &str| value[key].as_str().unwrap_or_default().trim().to_owned();
+        PackMeta {
+            name: field("name"),
+            author: field("author"),
+            version: field("version"),
+            description: field("description"),
+        }
+    }
+
+    /// `Name 1.2 by Author`, as far as it is known.
+    fn label(&self) -> String {
+        let mut label = self.name.clone();
+        if !self.version.is_empty() {
+            label = format!("{label} {}", self.version);
+        }
+        if !self.author.is_empty() {
+            label = crate::tf!("{} by {}", label, self.author).into_owned();
+        }
+        label
+    }
+}
+
+/// The export dialog: the package's details and which library entries go
+/// in it.
+#[derive(Clone, Debug)]
+pub struct PackDraft {
+    pub meta: PackMeta,
+    pub composites: Vec<(String, bool)>,
+    pub scripts: Vec<(String, bool)>,
+}
+
+/// A package read for import, waiting for the user to accept it.
+pub struct PackPreview {
+    pub meta: PackMeta,
+    /// The app version it was made with.
+    pub made_with: String,
+    pub composites: Vec<Arc<Composite>>,
+    pub scripts: Vec<Arc<Script>>,
+    /// Entries named like ones already in the library replace them;
+    /// otherwise they come in under a numbered name.
+    pub replace: bool,
+}
+
+impl PackPreview {
+    /// How many scripts it holds, inside composites too.
+    pub fn script_count(&self) -> usize {
+        fn inside(graph: &graph::Graph) -> usize {
+            graph
+                .nodes
+                .iter()
+                .map(|node| match &node.kind {
+                    Kind::Script(_) => 1,
+                    Kind::Composite(composite) => inside(&composite.graph),
+                    _ => 0,
+                })
+                .sum()
+        }
+        self.scripts.len()
+            + self
+                .composites
+                .iter()
+                .map(|composite| inside(&composite.graph))
+                .sum::<usize>()
+    }
+}
+
+/// The package file for `draft`: the entries it picks from the libraries.
+pub fn pack_file(draft: &PackDraft) -> Vec<u8> {
+    let picked = |entries: &[(String, bool)], name: &str| {
+        entries
+            .iter()
+            .any(|(entry, on)| *on && entry.eq_ignore_ascii_case(name))
+    };
+    let composites: Vec<Arc<Composite>> = composite_library()
+        .into_iter()
+        .filter(|composite| picked(&draft.composites, &composite.name))
+        .collect();
+    let scripts: Vec<Arc<Script>> = script_library()
+        .into_iter()
+        .filter(|script| picked(&draft.scripts, &script.name))
+        .collect();
+    pack_bytes(&draft.meta, &composites, &scripts)
+}
+
+/// A package of `composites` and `scripts` described by `meta`. The
+/// package an entry itself came in is left out: it now comes in this one.
+fn pack_bytes(meta: &PackMeta, composites: &[Arc<Composite>], scripts: &[Arc<Script>]) -> Vec<u8> {
+    let composites: Vec<Value> = composites
+        .iter()
+        .map(|composite| {
+            let mut item = composite.to_json();
+            if let Some(meta) = item.get_mut("meta").and_then(Value::as_object_mut) {
+                meta.remove("package");
+            }
+            item
+        })
+        .collect();
+    let scripts: Vec<Value> = scripts.iter().map(|script| script.to_json()).collect();
+    serde_json::to_vec_pretty(&json!({
+        "format": PACK_FORMAT,
+        "version": 1,
+        "package": meta.to_json(),
+        "app": env!("CARGO_PKG_VERSION"),
+        "composites": composites,
+        "scripts": scripts,
+    }))
+    .unwrap_or_default()
+}
+
+/// Reads a package, or an older composite library file (a JSON list).
+/// An entry using nodes this version lacks makes the whole file refused.
+pub fn read_pack(bytes: &[u8]) -> Result<PackPreview, String> {
+    let file: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let (meta, made_with, composites, scripts) = match &file {
+        Value::Array(items) => (
+            PackMeta::default(),
+            String::new(),
+            items.clone(),
+            Vec::new(),
+        ),
+        Value::Object(_) if file["format"] == PACK_FORMAT => (
+            PackMeta::from_json(&file["package"]),
+            file["app"].as_str().unwrap_or_default().to_owned(),
+            file["composites"].as_array().cloned().unwrap_or_default(),
+            file["scripts"].as_array().cloned().unwrap_or_default(),
+        ),
+        _ => return Err(t!("Not a node package").into_owned()),
+    };
+    let newer = |error: String| {
+        if made_with.is_empty() {
+            error
+        } else {
+            crate::tf!("{} (made with version {})", error, made_with).into_owned()
+        }
+    };
+    let composites = composites
+        .iter()
+        .map(|item| Composite::from_json(item).map(Arc::new))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(newer)?;
+    let scripts = scripts
+        .iter()
+        .map(Script::from_json)
+        .collect::<Result<Vec<_>, _>>()?;
+    if composites.is_empty() && scripts.is_empty() {
+        return Err(t!("The package is empty").into_owned());
+    }
+    Ok(PackPreview {
+        meta,
+        made_with,
+        composites,
+        scripts,
+        replace: false,
+    })
+}
+
+/// The name an imported entry takes: its own, or a numbered one when
+/// `taken` and not replacing.
+fn import_name(name: &str, replace: bool, taken: &dyn Fn(&str) -> bool) -> String {
+    if replace || !taken(name) {
+        return name.to_owned();
+    }
+    (2..)
+        .map(|n| format!("{name} {n}"))
+        .find(|candidate| !taken(candidate))
+        .unwrap_or_default()
+}
+
+fn composite_taken(name: &str) -> bool {
+    composite_library()
+        .iter()
+        .any(|composite| composite.name.eq_ignore_ascii_case(name))
+}
+
+fn script_taken(name: &str) -> bool {
+    script_library()
+        .iter()
+        .any(|script| script.name.eq_ignore_ascii_case(name))
+}
+
+/// Adds a previewed package's entries to the libraries, each marked with
+/// the package it came in; how many composites and scripts it added.
+pub fn install_pack(preview: &PackPreview) -> (usize, usize) {
+    let package = (preview.meta != PackMeta::default()).then(|| preview.meta.to_json());
+    for composite in &preview.composites {
+        let mut copy = (**composite).clone();
+        copy.name = import_name(&copy.name, preview.replace, &composite_taken);
+        if let (Some(package), Some(meta)) = (&package, copy.meta.as_object_mut()) {
+            meta.insert("package".to_owned(), package.clone());
+        } else if let Some(package) = &package {
+            copy.meta = json!({ "package": package });
+        }
+        save_to_library(Arc::new(copy));
+    }
+    for script in &preview.scripts {
+        let name = import_name(&script.name, preview.replace, &script_taken);
+        save_script_from(
+            Script::new(name, script.source.clone()),
+            package.clone().unwrap_or_default(),
+        );
+    }
+    (preview.composites.len(), preview.scripts.len())
 }
 
 fn trusted_store() -> &'static std::sync::Mutex<Vec<u64>> {
@@ -1280,6 +1525,10 @@ pub struct Graph {
     /// The graph was opened with scripts the user has not chosen to run:
     /// it is not evaluated until they do.
     pub scripts_paused: bool,
+    /// The package export dialog.
+    pub packing: Option<PackDraft>,
+    /// A package read for import, shown before it is installed.
+    pub unpacking: Option<PackPreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -1344,12 +1593,22 @@ pub enum GraphMsg {
     ForgetScript(usize),
     /// Runs the scripts of the graph just opened, and remembers the choice.
     TrustScripts,
-    /// Writes the composite library to a file the user picks.
+    /// Opens the package export dialog.
     LibraryExport,
-    /// Adds the composites of a library file the user picks.
+    /// A package detail typed: 0 name, 1 author, 2 version, 3 description.
+    PackField(usize, String),
+    /// Picks a composite (true) or script (false) entry in or out.
+    PackPick(bool, usize, bool),
+    PackCancel,
+    /// Writes the package the export dialog describes.
+    PackExport,
+    UnpackReplace(bool),
+    UnpackCancel,
+    UnpackConfirm,
+    /// Reads a package (or a composite library file) the user picks.
     LibraryImport,
     LibraryImported(Option<Vec<u8>>),
-    /// The library was written to this file, or failed to be.
+    /// The package was written to this file, or failed to be.
     LibraryExported(Option<Result<String, String>>),
     /// The pointer was released away from every card.
     DragCancel,
@@ -3031,6 +3290,10 @@ impl Graph {
             Some(self.composite_editor(draft))
         } else if let Some(draft) = &self.scripting {
             Some(self.script_editor(draft))
+        } else if let Some(draft) = &self.packing {
+            Some(self.pack_dialog(draft))
+        } else if let Some(preview) = &self.unpacking {
+            Some(self.unpack_dialog(preview))
         } else {
             self.picking
                 .as_ref()
@@ -4735,6 +4998,211 @@ impl Graph {
         modal(card.into(), GraphMsg::ScriptCheck)
     }
 
+    /// The package export dialog: its details and the entries to include.
+    fn pack_dialog<'a>(&'a self, draft: &'a PackDraft) -> Element<'a, Message> {
+        let field = |label: &str, value: &'a str, k: usize| {
+            column![
+                text(t!(label).into_owned()).size(10).style(weak_text),
+                text_input("", value)
+                    .on_input(move |text| msg(GraphMsg::PackField(k, text)))
+                    .size(11)
+                    .padding([3, 6])
+                    .width(Length::Fill),
+            ]
+            .spacing(2)
+        };
+        let meta = &draft.meta;
+        let list = |title: &str, entries: &'a [(String, bool)], composite: bool| {
+            let mut list = column![text(t!(title).into_owned()).size(11)].spacing(3);
+            if entries.is_empty() {
+                list = list.push(text(t!("None in the library")).size(10).style(weak_text));
+            }
+            for (k, (name, on)) in entries.iter().enumerate() {
+                list = list.push(
+                    checkbox(*on)
+                        .label(name.clone())
+                        .on_toggle(move |on| msg(GraphMsg::PackPick(composite, k, on)))
+                        .size(14)
+                        .text_size(11),
+                );
+            }
+            list.width(Length::FillPortion(1))
+        };
+        let picked = draft
+            .composites
+            .iter()
+            .chain(&draft.scripts)
+            .any(|(_, on)| *on);
+        let ready = picked && !meta.name.trim().is_empty();
+        let card = container(
+            column![
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::FILE_EXPORT, 16.0),
+                    text(t!("Export a package")).size(13)
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                row![
+                    field("Package name", &meta.name, 0),
+                    field("Author", &meta.author, 1),
+                    container(field("Version", &meta.version, 2)).width(90),
+                ]
+                .spacing(8),
+                field("Description", &meta.description, 3),
+                scrollable(
+                    row![
+                        list("Composites", &draft.composites, true),
+                        list("Scripts", &draft.scripts, false)
+                    ]
+                    .spacing(16)
+                )
+                .height(Length::Shrink),
+                text(t!(
+                    "The package holds the picked composites and scripts, and the scripts inside the composites. Blocks and layers they use are not included."
+                ))
+                .size(10)
+                .style(weak_text),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text(t!("Cancel")).size(11))
+                        .on_press(msg(GraphMsg::PackCancel))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    button(text(t!("Export")).size(11))
+                        .on_press_maybe(ready.then(|| msg(GraphMsg::PackExport)))
+                        .style(button::primary)
+                        .padding([4, 10]),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(PICKER_W + 60.0)
+        .style(card_style);
+        modal(card.into(), GraphMsg::PackCancel)
+    }
+
+    /// What a package holds, before it is installed: its details, each
+    /// entry and whether it replaces or sits beside one of the same name,
+    /// and a warning when it brings scripts.
+    fn unpack_dialog<'a>(&'a self, preview: &'a PackPreview) -> Element<'a, Message> {
+        let meta = &preview.meta;
+        let mut about = column![].spacing(2);
+        if !meta.name.is_empty() {
+            about = about.push(text(meta.label()).size(12));
+        }
+        if !meta.description.is_empty() {
+            about = about.push(text(meta.description.clone()).size(11).style(weak_text));
+        }
+        if !preview.made_with.is_empty() {
+            about = about.push(
+                text(crate::tf!("Made with OpenCADStudio {}", preview.made_with).into_owned())
+                    .size(10)
+                    .style(weak_text),
+            );
+        }
+        let entry = |name: &str, taken: bool| {
+            let note = match (taken, preview.replace) {
+                (false, _) => String::new(),
+                (true, true) => t!("replaces the one in the library").into_owned(),
+                (true, false) => crate::tf!(
+                    "comes in as {}",
+                    import_name(name, false, &|candidate| {
+                        composite_taken(candidate) || script_taken(candidate)
+                    })
+                )
+                .into_owned(),
+            };
+            row![
+                text(name.to_owned()).size(11),
+                text(note).size(10).style(weak_text)
+            ]
+            .spacing(8)
+        };
+        let mut composites = column![text(t!("Composites")).size(11)].spacing(3);
+        for composite in &preview.composites {
+            composites = composites.push(entry(&composite.name, composite_taken(&composite.name)));
+        }
+        let mut scripts = column![text(t!("Scripts")).size(11)].spacing(3);
+        for script in &preview.scripts {
+            scripts = scripts.push(entry(&script.name, script_taken(&script.name)));
+        }
+        let count = preview.script_count();
+        let warning: Element<'_, Message> = if count > 0 {
+            container(
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::WARNING, 12.0),
+                    text(
+                        crate::tf!(
+                            "It brings {} scripts. Scripts only compute and cannot touch files or the drawing, but import packages only from people you trust.",
+                            count
+                        )
+                        .into_owned()
+                    )
+                    .size(11),
+                ]
+                .spacing(6)
+                .align_y(iced::Center),
+            )
+            .padding([6, 8])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(ISSUE_COLOR.scale_alpha(0.15))),
+                border: Border {
+                    color: ISSUE_COLOR,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
+        let card = container(
+            column![
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::FOLDER_OPEN, 16.0),
+                    text(t!("Import a package")).size(13)
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                about,
+                scrollable(
+                    row![
+                        composites.width(Length::FillPortion(1)),
+                        scripts.width(Length::FillPortion(1))
+                    ]
+                    .spacing(16)
+                )
+                .height(Length::Shrink),
+                warning,
+                checkbox(preview.replace)
+                    .label(t!("Replace library entries of the same name").into_owned())
+                    .on_toggle(|on| msg(GraphMsg::UnpackReplace(on)))
+                    .size(14)
+                    .text_size(11),
+                row![
+                    Space::new().width(Length::Fill),
+                    button(text(t!("Cancel")).size(11))
+                        .on_press(msg(GraphMsg::UnpackCancel))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    button(text(t!("Import")).size(11))
+                        .on_press(msg(GraphMsg::UnpackConfirm))
+                        .style(button::primary)
+                        .padding([4, 10]),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(PICKER_W + 60.0)
+        .style(card_style);
+        modal(card.into(), GraphMsg::UnpackCancel)
+    }
+
     /// Asks before an edit drops links, naming each one.
     fn confirm_dialog(
         &self,
@@ -4832,6 +5300,18 @@ impl Graph {
         .padding([3, 10])
         .width(Length::Fill);
         let mut about = item.kind().map(|kind| describe(&kind)).unwrap_or_default();
+        let package = match item {
+            PaletteItem::Composite(k) => composite_library()
+                .get(k)
+                .map(|composite| composite.meta["package"].clone())
+                .unwrap_or_default(),
+            PaletteItem::Script(k) => script_package(k),
+            _ => Value::Null,
+        };
+        if package.is_object() {
+            let from = crate::tf!("From the package {}", PackMeta::from_json(&package).label());
+            about = format!("{about}\n{from}");
+        }
         if let PaletteItem::Op(spec) = item {
             if let Some(signature) = signature(spec) {
                 about = format!("{about}\n{signature}");
@@ -4936,7 +5416,7 @@ impl Graph {
                     .collect()
             };
             let items: Vec<PaletteItem> = items.into_iter().filter(|item| wanted(*item)).collect();
-            // Composites stays, empty, for its import button.
+            // Composites stays, empty, for its package buttons.
             let library = category == "Composites";
             if items.is_empty() && !(library && query.is_empty()) {
                 continue;
@@ -4981,12 +5461,13 @@ impl Graph {
                     heading,
                     icon_button(
                         crate::ui::icons::FILE_EXPORT,
-                        "Export the composite library",
-                        (!composite_library().is_empty()).then_some(GraphMsg::LibraryExport)
+                        "Export a package of composites and scripts",
+                        (!composite_library().is_empty() || !script_library().is_empty())
+                            .then_some(GraphMsg::LibraryExport)
                     ),
                     icon_button(
                         crate::ui::icons::FOLDER_OPEN,
-                        "Import composites",
+                        "Import a package",
                         Some(GraphMsg::LibraryImport)
                     ),
                 ]
@@ -5223,6 +5704,51 @@ impl Graph {
                 }
             }
             GraphMsg::ScriptCancel => self.scripting = None,
+            GraphMsg::LibraryExport => {
+                let entries =
+                    |names: Vec<String>| names.into_iter().map(|name| (name, true)).collect();
+                self.packing = Some(PackDraft {
+                    meta: PackMeta {
+                        version: "1.0".to_owned(),
+                        ..PackMeta::default()
+                    },
+                    composites: entries(
+                        composite_library().iter().map(|c| c.name.clone()).collect(),
+                    ),
+                    scripts: entries(script_library().iter().map(|s| s.name.clone()).collect()),
+                });
+            }
+            GraphMsg::PackField(k, value) => {
+                if let Some(draft) = &mut self.packing {
+                    let meta = &mut draft.meta;
+                    let field = match k {
+                        0 => &mut meta.name,
+                        1 => &mut meta.author,
+                        2 => &mut meta.version,
+                        _ => &mut meta.description,
+                    };
+                    *field = value.clone();
+                }
+            }
+            GraphMsg::PackPick(composite, k, on) => {
+                if let Some(draft) = &mut self.packing {
+                    let entries = if *composite {
+                        &mut draft.composites
+                    } else {
+                        &mut draft.scripts
+                    };
+                    if let Some(entry) = entries.get_mut(*k) {
+                        entry.1 = *on;
+                    }
+                }
+            }
+            GraphMsg::PackCancel => self.packing = None,
+            GraphMsg::UnpackReplace(on) => {
+                if let Some(preview) = &mut self.unpacking {
+                    preview.replace = *on;
+                }
+            }
+            GraphMsg::UnpackCancel => self.unpacking = None,
             GraphMsg::ForgetScript(k) => forget_script(*k),
             GraphMsg::TrustScripts => {
                 if let Some(fingerprint) = self.script_fingerprint() {
@@ -6092,6 +6618,60 @@ mod tests {
             panic!()
         };
         assert_eq!(back.source, graph::script::TEMPLATE);
+    }
+
+    #[test]
+    fn packages_carry_composites_and_scripts_with_their_details() {
+        // A composite holding a script, made from a group.
+        let mut graph = Graph::default();
+        let script = graph.add_node(PaletteItem::NewScript, Vec::new());
+        let after = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(script, "sum"), port(after, "x"));
+        graph.update_ui(&GraphMsg::GroupNew(script));
+        graph.update_ui(&GraphMsg::GroupAssign(after, graph.node_group(script)));
+        let id = graph
+            .make_composite(graph.node_group(script).unwrap())
+            .unwrap();
+        let Kind::Composite(composite) = graph.engine.node(id).unwrap().kind.clone() else {
+            panic!()
+        };
+        let meta = PackMeta {
+            name: "Walls".into(),
+            author: "Ana".into(),
+            version: "2.1".into(),
+            description: "Walls and openings".into(),
+        };
+        let loose = Script::new("Posts", graph::script::TEMPLATE);
+        let bytes = pack_bytes(&meta, &[composite], &[loose]);
+        let preview = read_pack(&bytes).unwrap();
+        assert_eq!(preview.meta, meta);
+        assert_eq!(preview.meta.label(), "Walls 2.1 by Ana");
+        assert_eq!(preview.made_with, env!("CARGO_PKG_VERSION"));
+        assert_eq!((preview.composites.len(), preview.scripts.len()), (1, 1));
+        assert_eq!(
+            preview.script_count(),
+            2,
+            "the loose one and the one inside"
+        );
+
+        // An older composite library file is read too, without details.
+        let legacy = serde_json::to_vec(&json!([preview.composites[0].to_json()])).unwrap();
+        let old = read_pack(&legacy).unwrap();
+        assert_eq!(old.meta, PackMeta::default());
+        assert!(read_pack(b"{\"format\": \"other\"}").is_err());
+        let unknown = String::from_utf8(bytes)
+            .unwrap()
+            .replace("\"Negate\"", "\"Teleport\"");
+        let refused = read_pack(unknown.as_bytes()).err().unwrap();
+        assert!(
+            refused.contains("Teleport") && refused.contains("made with"),
+            "{refused}"
+        );
+
+        let taken = |name: &str| name == "Walls" || name == "Walls 2";
+        assert_eq!(import_name("Walls", false, &taken), "Walls 3");
+        assert_eq!(import_name("Walls", true, &taken), "Walls");
+        assert_eq!(import_name("Doors", false, &taken), "Doors");
     }
 
     #[test]

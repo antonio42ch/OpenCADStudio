@@ -2170,6 +2170,43 @@ mod tests {
         );
     }
 
+    /// Nodes pasted with a script from elsewhere pause the graph until the
+    /// user lets it run; a copy of one of its own scripts does not.
+    #[test]
+    fn pasted_strange_scripts_pause_the_graph() {
+        use crate::ui::node_graph::GraphMsg;
+        let mut app = app();
+        let i = app.active_tab;
+        let source = format!("// outputs: y: number\n{}", std::process::id());
+        apply_changes(
+            &mut app,
+            "pp1",
+            json!([{"add": {"script": {"name": "Own", "source": source}}}]),
+        );
+        let own = app.tabs[i].graph.engine.nodes[0].id;
+        let copy = app.tabs[i].graph.copy_text(&[own]);
+        let _ = app.on_graph(GraphMsg::Pasted(Some(copy)));
+        assert!(
+            !app.tabs[i].graph.scripts_paused,
+            "a copy of its own script"
+        );
+
+        let mut other = crate::ui::node_graph::Graph::default();
+        let strange = other.add_named(
+            Kind::Script(graph::script::Script::new(
+                "Strange",
+                format!("{source}\n// from elsewhere"),
+            )),
+            "Strange".into(),
+            Vec::new(),
+        );
+        let text = other.copy_text(&[strange]);
+        let _ = app.on_graph(GraphMsg::Pasted(Some(text)));
+        assert!(app.tabs[i].graph.scripts_paused);
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Strange", "y"), Value::Null, "not run");
+    }
+
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {
         let query = app.automation_op(&format!(
             r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#

@@ -692,6 +692,30 @@ impl OpenCADStudio {
                 {
                     Ok(added) => {
                         self.tabs[i].graph.steps_hidden = false;
+                        // Scripts pasted from elsewhere wait for the user's word;
+                        // copies of ones this graph or the library holds do not.
+                        let graph = &mut self.tabs[i].graph;
+                        let known = |source: &str| {
+                            graph.engine.nodes.iter().any(|node| {
+                                !added.contains(&node.id)
+                                    && matches!(&node.kind, Kind::Script(script) if script.source == source)
+                            }) || crate::ui::node_graph::script_library()
+                                .iter()
+                                .any(|script| script.source == source)
+                        };
+                        let strange = added.iter().any(|id| {
+                            matches!(
+                                graph.engine.node(*id).map(|node| &node.kind),
+                                Some(Kind::Script(script)) if !known(&script.source)
+                            )
+                        });
+                        if strange
+                            && graph.script_fingerprint().is_some_and(|fingerprint| {
+                                !crate::ui::node_graph::scripts_trusted(fingerprint)
+                            })
+                        {
+                            graph.scripts_paused = true;
+                        }
                         self.command_line
                             .push_output(crate::tf!("{} nodes pasted", added.len()).as_ref());
                         return self.graph_run(i);
@@ -797,14 +821,26 @@ impl OpenCADStudio {
                 self.tabs[i].graph.clear();
             }
             GraphMsg::CompositeEditSave => return self.graph_run(i),
+            // The package dialogs show over the node graph.
             GraphMsg::LibraryExport => {
-                let bytes = crate::ui::node_graph::library_file();
+                self.show_node_graph = true;
+                self.tabs[i].graph.steps_hidden = false;
+            }
+            GraphMsg::PackExport => {
+                let Some(draft) = self.tabs[i].graph.packing.take() else {
+                    return Task::none();
+                };
+                let bytes = crate::ui::node_graph::pack_file(&draft);
+                let file_name = format!(
+                    "{}.ocgpack",
+                    draft.meta.name.trim().replace(['/', '\\', ':'], "-")
+                );
                 return Task::perform(
                     async move {
                         let handle = crate::sys::file_dialog()
-                            .set_title(crate::t!("Export the composite library").as_ref())
-                            .add_filter(crate::t!("Composites").as_ref(), &["json"])
-                            .set_file_name("composites.json")
+                            .set_title(crate::t!("Export a package").as_ref())
+                            .add_filter(crate::t!("Node package").as_ref(), &["ocgpack"])
+                            .set_file_name(&file_name)
                             .save_file()
                             .await?;
                         let name = crate::sys::handle_path(&handle)
@@ -823,14 +859,14 @@ impl OpenCADStudio {
             }
             GraphMsg::LibraryExported(Some(Ok(name))) => self
                 .command_line
-                .push_output(crate::tf!("Composite library exported to {}", name).as_ref()),
+                .push_output(crate::tf!("Package exported to {}", name).as_ref()),
             GraphMsg::LibraryExported(Some(Err(error))) => self.command_line.push_error(&error),
             GraphMsg::LibraryImport => {
                 return Task::perform(
                     async {
                         let handle = crate::sys::file_dialog()
-                            .set_title(crate::t!("Import composites").as_ref())
-                            .add_filter(crate::t!("Composites").as_ref(), &["json"])
+                            .set_title(crate::t!("Import a package").as_ref())
+                            .add_filter(crate::t!("Node package").as_ref(), &["ocgpack", "json"])
                             .pick_file()
                             .await?;
                         Some(handle.read().await)
@@ -839,13 +875,28 @@ impl OpenCADStudio {
                 );
             }
             GraphMsg::LibraryImported(Some(bytes)) => {
-                match crate::ui::node_graph::import_library(&bytes) {
-                    Ok(count) => self.command_line.push_output(
-                        crate::tf!("{} composites added to the library", count).as_ref(),
-                    ),
+                match crate::ui::node_graph::read_pack(&bytes) {
+                    Ok(preview) => {
+                        self.show_node_graph = true;
+                        self.tabs[i].graph.steps_hidden = false;
+                        self.tabs[i].graph.unpacking = Some(preview);
+                    }
                     Err(error) => self
                         .command_line
-                        .push_error(crate::tf!("Not a composite library: {}", error).as_ref()),
+                        .push_error(crate::tf!("Not a node package: {}", error).as_ref()),
+                }
+            }
+            GraphMsg::UnpackConfirm => {
+                if let Some(preview) = self.tabs[i].graph.unpacking.take() {
+                    let (composites, scripts) = crate::ui::node_graph::install_pack(&preview);
+                    self.command_line.push_output(
+                        crate::tf!(
+                            "{} composites and {} scripts added to the libraries",
+                            composites,
+                            scripts
+                        )
+                        .as_ref(),
+                    );
                 }
             }
             GraphMsg::Save => {
@@ -862,6 +913,10 @@ impl OpenCADStudio {
                 let bytes = tab
                     .graph
                     .to_file(&tab.scene.document.header.fingerprint_guid);
+                // A graph the user saves holds scripts they run.
+                if let Some(fingerprint) = tab.graph.script_fingerprint() {
+                    crate::ui::node_graph::trust_scripts(fingerprint);
+                }
                 return Task::perform(
                     async move {
                         let handle = crate::sys::file_dialog()
