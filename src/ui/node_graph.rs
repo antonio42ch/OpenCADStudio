@@ -1184,6 +1184,16 @@ fn tip_box<'a>(content: String) -> Element<'a, Message> {
 }
 
 pub type GroupId = u32;
+pub type SequenceId = u32;
+
+/// A node sequence: steps run from left to right, each reading the inputs
+/// and earlier steps of its own sequence only.
+#[derive(Clone, Debug)]
+pub struct NodeSequence {
+    pub id: SequenceId,
+    pub name: String,
+    pub collapsed: bool,
+}
 
 /// Canvas state of one node.
 #[derive(Clone)]
@@ -1196,6 +1206,8 @@ pub struct NodeUi {
     /// Entities an object node owns, one per list element.
     pub handles: Vec<Handle>,
     pub group: Option<GroupId>,
+    /// The node sequence a step belongs to; inputs serve every sequence.
+    pub sequence: SequenceId,
 }
 
 /// A named run of steps in the node sequence, or of cards in the Inputs area.
@@ -1244,6 +1256,7 @@ pub struct NodeRow {
 pub enum Renaming {
     Node(NodeId),
     Group(GroupId),
+    Sequence(SequenceId),
 }
 
 /// An edit that would break links, held until the user confirms it.
@@ -1318,6 +1331,7 @@ pub(crate) struct Snapshot {
     engine: graph::Graph,
     ui: HashMap<NodeId, NodeUi>,
     groups: Vec<NodeGroup>,
+    sequences: Vec<NodeSequence>,
 }
 
 impl Snapshot {
@@ -1470,6 +1484,11 @@ pub struct Graph {
     pub engine: graph::Graph,
     pub ui: HashMap<NodeId, NodeUi>,
     pub groups: Vec<NodeGroup>,
+    /// The node sequences, in the order they show; empty means the one
+    /// first sequence.
+    pub sequences: Vec<NodeSequence>,
+    /// The sequence new steps join.
+    pub active_sequence: SequenceId,
     pub drafts: HashMap<Port, String>,
     /// The step input whose source the value picker is choosing.
     pub picking: Option<Port>,
@@ -1631,6 +1650,23 @@ pub enum GraphMsg {
     NodeSearch(String),
     /// Shows the next (1) or previous (-1) match.
     NodeSearchStep(i32),
+    /// Adds a node sequence, where new steps then go.
+    SequenceNew,
+    /// Makes a sequence the one new steps join.
+    SequenceActivate(SequenceId),
+    SequenceRenameStart(SequenceId),
+    SequenceCollapse(SequenceId),
+    /// Deletes a sequence with its steps.
+    SequenceDelete(SequenceId),
+    /// Runs every node of a sequence again, rereading files and drawn
+    /// objects.
+    SequenceRun(SequenceId),
+    /// Runs every node of the graph again.
+    RunAll,
+    /// Moves a step to the end of another sequence, asking when that
+    /// breaks links.
+    MoveToSequence(NodeId, SequenceId),
+    MoveToSequenceNow(NodeId, SequenceId),
     ToggleCompact,
     /// Turns a Number into a slider, or a slider back into a Number.
     ToggleSlider(NodeId),
@@ -1884,7 +1920,13 @@ impl Graph {
                 let handles: Vec<u64> = ui.handles.iter().map(|handle| handle.value()).collect();
                 (
                     id.to_string(),
-                    json!({ "name": ui.name, "open": open, "handles": handles, "group": ui.group }),
+                    json!({
+                        "name": ui.name,
+                        "open": open,
+                        "handles": handles,
+                        "group": ui.group,
+                        "sequence": ui.sequence,
+                    }),
                 )
             })
             .collect();
@@ -1912,6 +1954,12 @@ impl Graph {
                 "preview_hidden": self.preview_hidden,
                 "compact": self.compact,
                 "groups": groups,
+                "sequences": self.sequences.iter().map(|sequence| json!({
+                    "id": sequence.id,
+                    "name": sequence.name,
+                    "collapsed": sequence.collapsed,
+                })).collect::<Vec<_>>(),
+                "active_sequence": self.active_sequence,
                 "nodes": nodes,
             },
         });
@@ -1947,6 +1995,18 @@ impl Graph {
         graph.steps_hidden = canvas["steps_hidden"].as_bool().unwrap_or(false);
         graph.preview_hidden = canvas["preview_hidden"].as_bool().unwrap_or(false);
         graph.compact = canvas["compact"].as_bool().unwrap_or(false);
+        for sequence in canvas["sequences"].as_array().into_iter().flatten() {
+            let (Some(id), Some(name)) = (sequence["id"].as_u64(), sequence["name"].as_str())
+            else {
+                continue;
+            };
+            graph.sequences.push(NodeSequence {
+                id: id as SequenceId,
+                name: name.to_owned(),
+                collapsed: sequence["collapsed"].as_bool().unwrap_or(false),
+            });
+        }
+        graph.active_sequence = canvas["active_sequence"].as_u64().unwrap_or(1) as SequenceId;
         for group in canvas["groups"].as_array().into_iter().flatten() {
             let (Some(id), Some(name)) = (group["id"].as_u64(), group["name"].as_str()) else {
                 continue;
@@ -1998,6 +2058,7 @@ impl Graph {
                         .iter()
                         .any(|known| known.id == *group && known.inputs == input)
                 });
+            let sequence = saved["sequence"].as_u64().map_or(1, |id| id as SequenceId);
             graph.ui.insert(
                 id,
                 NodeUi {
@@ -2005,9 +2066,11 @@ impl Graph {
                     open,
                     handles,
                     group,
+                    sequence,
                 },
             );
         }
+        graph.normalize_sequences();
         graph.prune_links();
         graph.prune_groups();
         Ok((
@@ -2021,6 +2084,7 @@ impl Graph {
             engine: self.engine.clone(),
             ui: self.ui.clone(),
             groups: self.groups.clone(),
+            sequences: self.sequences.clone(),
         }
     }
 
@@ -2028,6 +2092,7 @@ impl Graph {
         self.engine = snapshot.engine;
         self.ui = snapshot.ui;
         self.groups = snapshot.groups;
+        self.sequences = snapshot.sequences;
         self.picking = None;
         self.renaming = None;
         self.confirm = None;
@@ -2058,6 +2123,7 @@ impl Graph {
         self.engine = snapshot.engine;
         self.ui = snapshot.ui;
         self.groups = snapshot.groups;
+        self.sequences = snapshot.sequences;
     }
 
     pub fn can_undo(&self) -> bool {
@@ -2137,6 +2203,7 @@ impl Graph {
         let id = self.engine.add(kind);
         let mut open = HashSet::default();
         open.insert(t!("Geometry").into_owned());
+        let sequence = self.active();
         self.ui.insert(
             id,
             NodeUi {
@@ -2144,9 +2211,174 @@ impl Graph {
                 open,
                 handles,
                 group: None,
+                sequence,
             },
         );
         id
+    }
+
+    /// The node sequences, the first one standing in while none is listed.
+    pub fn sequence_list(&self) -> Vec<NodeSequence> {
+        if self.sequences.is_empty() {
+            return vec![NodeSequence {
+                id: 1,
+                name: crate::tf!("Sequence {}", 1).into_owned(),
+                collapsed: false,
+            }];
+        }
+        self.sequences.clone()
+    }
+
+    /// The sequence new steps join: the chosen one while it exists, else
+    /// the first.
+    pub fn active(&self) -> SequenceId {
+        let list = self.sequence_list();
+        if list
+            .iter()
+            .any(|sequence| sequence.id == self.active_sequence)
+        {
+            self.active_sequence
+        } else {
+            list[0].id
+        }
+    }
+
+    /// The sequence step `id` belongs to; `None` for an input.
+    pub fn node_sequence(&self, id: NodeId) -> Option<SequenceId> {
+        let node = self.engine.node(id)?;
+        if is_input(&node.kind) {
+            return None;
+        }
+        Some(self.ui.get(&id).map_or(1, |ui| ui.sequence))
+    }
+
+    /// The sequence called `name`, ignoring case.
+    pub fn sequence_named(&self, name: &str) -> Option<SequenceId> {
+        self.sequence_list()
+            .iter()
+            .find(|sequence| sequence.name.eq_ignore_ascii_case(name.trim()))
+            .map(|sequence| sequence.id)
+    }
+
+    pub fn sequence_name(&self, id: SequenceId) -> String {
+        self.sequence_list()
+            .into_iter()
+            .find(|sequence| sequence.id == id)
+            .map(|sequence| sequence.name)
+            .unwrap_or_default()
+    }
+
+    /// Adds a sequence after the others and makes it the one new steps
+    /// join; with no name, it is numbered.
+    pub fn new_sequence(&mut self, name: Option<&str>) -> SequenceId {
+        if self.sequences.is_empty() {
+            self.sequences = self.sequence_list();
+        }
+        let id = self
+            .sequences
+            .iter()
+            .map(|sequence| sequence.id)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        let name = match name.map(str::trim).filter(|name| !name.is_empty()) {
+            Some(name) => name.to_owned(),
+            None => (id..)
+                .map(|n| crate::tf!("Sequence {}", n).into_owned())
+                .find(|name| self.sequence_named(name).is_none())
+                .unwrap_or_default(),
+        };
+        self.sequences.push(NodeSequence {
+            id,
+            name,
+            collapsed: false,
+        });
+        self.active_sequence = id;
+        id
+    }
+
+    /// Forgets sequence `id` (its steps must be gone already); new steps then
+    /// join the first sequence.
+    pub(crate) fn drop_sequence(&mut self, id: SequenceId) {
+        if self.sequences.is_empty() {
+            self.sequences = self.sequence_list();
+        }
+        if self.sequences.len() > 1 {
+            self.sequences.retain(|sequence| sequence.id != id);
+        }
+        if self.active_sequence == id {
+            self.active_sequence = self.sequences[0].id;
+        }
+        self.normalize_sequences();
+        self.revision += 1;
+    }
+
+    /// Steps of a sequence that no longer exists join the first one.
+    pub(crate) fn normalize_sequences(&mut self) {
+        let list = self.sequence_list();
+        let first = list[0].id;
+        let ids: Vec<NodeId> = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| !is_input(&node.kind))
+            .map(|node| node.id)
+            .collect();
+        for id in ids {
+            if let Some(ui) = self.ui.get_mut(&id) {
+                if !list.iter().any(|sequence| sequence.id == ui.sequence) {
+                    ui.sequence = first;
+                }
+            }
+        }
+    }
+
+    /// The steps of sequence `id`, in order.
+    pub fn sequence_steps(&self, id: SequenceId) -> Vec<NodeId> {
+        self.engine
+            .nodes
+            .iter()
+            .filter(|node| self.node_sequence(node.id) == Some(id))
+            .map(|node| node.id)
+            .collect()
+    }
+
+    /// Moves step `id` into sequence `to`, after its last step; links that
+    /// no longer hold go.
+    pub(crate) fn move_to_sequence(&mut self, id: NodeId, to: SequenceId) {
+        if self.node_sequence(id).is_none() {
+            return;
+        }
+        if let Some(index) = self.engine.nodes.iter().position(|node| node.id == id) {
+            let node = self.engine.nodes.remove(index);
+            self.engine.nodes.push(node);
+        }
+        if let Some(ui) = self.ui.get_mut(&id) {
+            ui.sequence = to;
+            ui.group = None;
+        }
+        self.prune_links();
+        self.prune_groups();
+    }
+
+    /// The links moving step `id` into sequence `to` would break.
+    pub(crate) fn sequence_move_breaks(&self, id: NodeId, to: SequenceId) -> Vec<Link> {
+        self.engine
+            .links
+            .iter()
+            .filter(|link| {
+                let other = if link.to.node == id {
+                    link.from.node
+                } else if link.from.node == id {
+                    link.to.node
+                } else {
+                    return false;
+                };
+                self.node_sequence(other)
+                    .is_some_and(|sequence| sequence != to)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Copies `id` right after itself: its kind, values, sections, group and
@@ -2166,6 +2398,7 @@ impl Graph {
         if let Some(copy_ui) = self.ui.get_mut(&copy) {
             copy_ui.open = ui.open;
             copy_ui.group = ui.group;
+            copy_ui.sequence = ui.sequence;
         }
         let incoming: Vec<Link> = self
             .engine
@@ -2508,7 +2741,12 @@ impl Graph {
                     return true;
                 }
                 match (steps.get(&link.from.node), steps.get(&link.to.node)) {
-                    (Some(from), Some(to)) => from >= to,
+                    // Steps read earlier steps of their own sequence only.
+                    (Some(from), Some(to)) => {
+                        from >= to
+                            || self.node_sequence(link.from.node)
+                                != self.node_sequence(link.to.node)
+                    }
                     _ => !inputs.contains(&link.from.node),
                 }
             })
@@ -2533,17 +2771,18 @@ impl Graph {
         self.groups.retain(|group| used.contains(&group.id));
     }
 
-    /// Indices in `engine.nodes` of the nodes in `id`'s area.
+    /// Indices in `engine.nodes` of the nodes in `id`'s area: the inputs,
+    /// or the steps of its sequence.
     fn area(&self, id: NodeId) -> Vec<usize> {
-        let input = self
-            .engine
-            .node(id)
-            .is_some_and(|node| is_input(&node.kind));
+        let sequence = self.node_sequence(id);
+        let input = sequence.is_none();
         self.engine
             .nodes
             .iter()
             .enumerate()
-            .filter(|(_, node)| is_input(&node.kind) == input)
+            .filter(|(_, node)| {
+                is_input(&node.kind) == input && (input || self.node_sequence(node.id) == sequence)
+            })
             .map(|(index, _)| index)
             .collect()
     }
@@ -2789,8 +3028,15 @@ impl Graph {
         Some(order)
     }
 
-    /// Links dropping `id` on `target` would break.
+    /// Links dropping `id` on `target` would break; dropped on a step of
+    /// another sequence, it moves into that sequence.
     fn move_to_breaks(&self, id: NodeId, target: NodeId) -> Vec<Link> {
+        if let Some(to) = self
+            .node_sequence(target)
+            .filter(|to| self.node_sequence(id) != Some(*to))
+        {
+            return self.sequence_move_breaks(id, to);
+        }
         let Some(order) = self.order_moved_to(id, target) else {
             return Vec::new();
         };
@@ -2811,8 +3057,12 @@ impl Graph {
             .collect();
         self.engine.nodes = order.iter().filter_map(|&k| nodes[k].take()).collect();
         let group = self.node_group(target);
+        let sequence = self.node_sequence(target);
         if let Some(ui) = self.ui.get_mut(&id) {
             ui.group = group;
+            if let Some(sequence) = sequence {
+                ui.sequence = sequence;
+            }
         }
         self.prune_links();
         self.prune_groups();
@@ -2873,6 +3123,15 @@ impl Graph {
             .collect();
         if members.is_empty() {
             return Err(t!("Choose the steps to put in the composite").into_owned());
+        }
+        let sequence = self
+            .node_sequence(members[0])
+            .unwrap_or_else(|| self.active());
+        if members.iter().any(|id| {
+            self.node_sequence(*id)
+                .is_some_and(|other| other != sequence)
+        }) {
+            return Err(t!("A composite takes steps of one sequence").into_owned());
         }
         for id in &members {
             match self.engine.node(*id).map(|node| &node.kind) {
@@ -2952,6 +3211,7 @@ impl Graph {
                 open,
                 handles: Vec::new(),
                 group: None,
+                sequence,
             },
         );
         self.prune_groups();
@@ -2994,6 +3254,7 @@ impl Graph {
             return Err(crate::tf!("{} is not a composite", self.name(id)).into_owned());
         };
         let title = self.name(id);
+        let sequence = self.node_sequence(id).unwrap_or_else(|| self.active());
         let ids = self.engine.expand(id)?;
         self.ui.remove(&id);
         self.drafts.retain(|port, _| port.node != id);
@@ -3019,6 +3280,7 @@ impl Graph {
                     open,
                     handles: Vec::new(),
                     group: None,
+                    sequence,
                 },
             );
         }
@@ -3320,7 +3582,6 @@ impl Graph {
                 steps.push((node, node_sections));
             }
         }
-        let step_count = steps.len();
 
         let inputs_body: Element<'_, Message> = if inputs.is_empty() {
             text(t!(
@@ -3411,44 +3672,86 @@ impl Graph {
             ))
             .padding([12, 6])
         };
-        let sequence_body: Element<'_, Message> = if steps.is_empty() {
-            container(
-                text(t!(
-                    "Add objects or operations from the Node Graph panel, or select drawn objects and press From drawing. Steps run from left to right, and each one takes its values from an earlier step or from the inputs."
-                ))
-                .size(11)
-                .style(weak_text),
-            )
-            .width(360)
-            .into()
-        } else {
-            let mut track = row![].spacing(0).align_y(iced::Top);
-            let mut step = 0;
-            for (index, (group, members)) in self.runs(steps).into_iter().enumerate() {
-                if index > 0 {
-                    track = track.push(arrow());
-                }
-                let mut lane = row![].spacing(0).align_y(iced::Top);
-                let count = members.len();
-                for (k, (node, node_sections)) in members.into_iter().enumerate() {
-                    if k > 0 {
-                        lane = lane.push(arrow());
+        // Steps by sequence, each in its own lane under its header.
+        let list = self.sequence_list();
+        let several = list.len() > 1;
+        let mut by_sequence: HashMap<SequenceId, Vec<(&graph::Node, Vec<NodeSection>)>> =
+            HashMap::default();
+        for (node, node_sections) in steps {
+            let sequence = self.node_sequence(node.id).unwrap_or(list[0].id);
+            by_sequence
+                .entry(sequence)
+                .or_default()
+                .push((node, node_sections));
+        }
+        let mut lanes = column![].spacing(10);
+        for sequence in &list {
+            let members = by_sequence.remove(&sequence.id).unwrap_or_default();
+            let count = members.len();
+            let mut lane = column![self.sequence_header(sequence, count, several)].spacing(6);
+            if sequence.collapsed {
+                // Only the header shows.
+            } else if members.is_empty() {
+                lane = lane.push(
+                    container(
+                        text(t!(
+                            "Add objects or operations from the Node Graph panel, or select drawn objects and press From drawing. Steps run from left to right, and each one takes its values from an earlier step or from the inputs."
+                        ))
+                        .size(11)
+                        .style(weak_text),
+                    )
+                    .width(360),
+                );
+            } else {
+                let mut track = row![].spacing(0).align_y(iced::Top);
+                let mut step = 0;
+                for (index, (group, members)) in self.runs(members).into_iter().enumerate() {
+                    if index > 0 {
+                        track = track.push(arrow());
                     }
-                    step += 1;
-                    lane =
-                        lane.push(self.step_card(step, step_count, node, node_sections, &sources));
+                    let mut run = row![].spacing(0).align_y(iced::Top);
+                    let run_count = members.len();
+                    for (k, (node, node_sections)) in members.into_iter().enumerate() {
+                        if k > 0 {
+                            run = run.push(arrow());
+                        }
+                        step += 1;
+                        run = run.push(self.step_card(step, count, node, node_sections, &sources));
+                    }
+                    track = track.push(match group {
+                        Some(group) => self.group_frame(group, run_count, run.into()),
+                        None => run.into(),
+                    });
                 }
-                track = track.push(match group {
-                    Some(group) => self.group_frame(group, count, lane.into()),
-                    None => lane.into(),
-                });
+                lane = lane.push(track);
             }
-            Scaled {
-                content: track.into(),
-                zoom: self.zoom(),
-            }
-            .into()
-        };
+            let active = several && sequence.id == self.active();
+            lanes = lanes.push(container(lane).padding(if several { 6 } else { 0 }).style(
+                move |theme: &Theme| {
+                    if !several {
+                        return container::Style::default();
+                    }
+                    let palette = theme.palette();
+                    container::Style {
+                        border: Border {
+                            color: if active {
+                                palette.primary.base.color
+                            } else {
+                                palette.background.strong.color
+                            },
+                            width: if active { 1.5 } else { 1.0 },
+                            radius: 8.0.into(),
+                        },
+                        ..Default::default()
+                    }
+                },
+            ));
+        }
+        let sequence_body: Element<'_, Message> = Scaled {
+            content: lanes.into(),
+            zoom: self.zoom(),
+        }
+        .into();
         let zoom_button = |icon: &'static [u8], tip: &str, steps: i32, enabled: bool| {
             icon_button(icon, tip, enabled.then_some(GraphMsg::Zoom(steps)))
         };
@@ -3523,6 +3826,32 @@ impl Graph {
                 tooltip::Position::Bottom,
             )
             .gap(4),
+            Space::new().width(10),
+            tooltip(
+                button(
+                    row![
+                        crate::ui::icons::themed(crate::ui::icons::PLUS, 11.0),
+                        text(t!("New sequence")).size(11)
+                    ]
+                    .spacing(4)
+                    .align_y(iced::Center),
+                )
+                .on_press(msg(GraphMsg::SequenceNew))
+                .style(button::secondary)
+                .padding([3, 8]),
+                container(
+                    text(t!("Another sequence of nodes: it reads the inputs but no step of the other sequences")).size(10)
+                )
+                .padding([2, 6])
+                .style(container::bordered_box),
+                tooltip::Position::Bottom,
+            )
+            .gap(4),
+            icon_button(
+                crate::ui::icons::REFRESH,
+                "Run every node again, rereading files and drawn objects",
+                Some(GraphMsg::RunAll)
+            ),
             Space::new().width(10),
             icon_button(
                 if self.compact {
@@ -3711,6 +4040,90 @@ impl Graph {
         runs.into_iter()
             .map(|(group, members)| (group.and_then(|group| self.group(group)), members))
             .collect()
+    }
+
+    /// A sequence's header: collapse, its name (click to rename), its size,
+    /// whether new steps join it, run and delete.
+    fn sequence_header<'a>(
+        &'a self,
+        sequence: &NodeSequence,
+        count: usize,
+        several: bool,
+    ) -> Element<'a, Message> {
+        let id = sequence.id;
+        let name: Element<'_, Message> = match &self.renaming {
+            Some((Renaming::Sequence(renaming), draft)) if *renaming == id => text_input("", draft)
+                .id(iced::widget::Id::new(RENAME_ID))
+                .on_input(|value| msg(GraphMsg::RenameInput(value)))
+                .on_submit(msg(GraphMsg::RenameCommit))
+                .size(12)
+                .padding([2, 4])
+                .width(180)
+                .into(),
+            _ => tooltip(
+                button(text(sequence.name.clone()).size(12))
+                    .on_press(msg(GraphMsg::SequenceRenameStart(id)))
+                    .style(button::text)
+                    .padding(0),
+                container(text(t!("Click to rename").into_owned()).size(10))
+                    .padding([2, 6])
+                    .style(container::bordered_box),
+                tooltip::Position::Top,
+            )
+            .gap(4)
+            .into(),
+        };
+        let target: Element<'_, Message> = if !several {
+            Space::new().width(0).into()
+        } else if self.active() == id {
+            container(text(t!("New nodes go here")).size(10))
+                .padding([2, 6])
+                .style(|theme: &Theme| container::Style {
+                    background: Some(Background::Color(theme.palette().primary.weak.color)),
+                    text_color: Some(theme.palette().primary.weak.text),
+                    border: Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .into()
+        } else {
+            button(text(t!("Add nodes here")).size(10))
+                .on_press(msg(GraphMsg::SequenceActivate(id)))
+                .style(button::secondary)
+                .padding([2, 6])
+                .into()
+        };
+        row![
+            button(crate::ui::icons::themed_arrow_toggle(
+                !sequence.collapsed,
+                9.0
+            ))
+            .on_press(msg(GraphMsg::SequenceCollapse(id)))
+            .style(button::text)
+            .padding([4, 4]),
+            name,
+            text(crate::tf!("{} steps", count).into_owned())
+                .size(10)
+                .style(weak_text),
+            target,
+            // No filling space: the lanes scroll sideways.
+            Space::new().width(12),
+            icon_button(
+                crate::ui::icons::REFRESH,
+                "Run every node of this sequence again, rereading files and drawn objects",
+                Some(GraphMsg::SequenceRun(id)),
+            ),
+            icon_button(
+                crate::ui::icons::TRASH,
+                "Delete the sequence and its steps",
+                several.then_some(GraphMsg::SequenceDelete(id)),
+            ),
+        ]
+        .spacing(6)
+        .align_y(iced::Center)
+        .into()
     }
 
     /// A group's frame: a tinted panel with its colour chip, name (click to
@@ -3943,6 +4356,31 @@ impl Graph {
         .into()
     }
 
+    /// The sequence list at the foot of a step's card, while there are
+    /// several: picking another moves the step there.
+    fn sequence_picker(&self, id: NodeId) -> Element<'_, Message> {
+        let list = self.sequence_list();
+        let (Some(current), true) = (self.node_sequence(id), list.len() > 1) else {
+            return Space::new().width(0).into();
+        };
+        let names: Vec<String> = list.iter().map(|sequence| sequence.name.clone()).collect();
+        let selected = list
+            .iter()
+            .find(|sequence| sequence.id == current)
+            .map(|sequence| sequence.name.clone());
+        pick_list(selected, names, String::clone)
+            .on_select(move |name| {
+                let to = list
+                    .iter()
+                    .find(|sequence| sequence.name == name)
+                    .map_or(current, |sequence| sequence.id);
+                msg(GraphMsg::MoveToSequence(id, to))
+            })
+            .text_size(10)
+            .padding([1, 6])
+            .into()
+    }
+
     /// The group list at the foot of a card.
     fn group_picker(&self, id: NodeId) -> Element<'_, Message> {
         let input = self
@@ -3950,10 +4388,20 @@ impl Graph {
             .node(id)
             .is_some_and(|node| is_input(&node.kind));
         let mut options = vec![GroupChoice::None];
+        // A step joins only groups of its own sequence.
+        let sequence = self.node_sequence(id);
+        let elsewhere = |group: GroupId| {
+            self.ui.iter().any(|(member, ui)| {
+                ui.group == Some(group)
+                    && self
+                        .node_sequence(*member)
+                        .is_some_and(|other| Some(other) != sequence)
+            })
+        };
         options.extend(
             self.groups
                 .iter()
-                .filter(|group| group.inputs == input)
+                .filter(|group| group.inputs == input && (input || !elsewhere(group.id)))
                 .map(|group| GroupChoice::Join(group.id, group.name.clone())),
         );
         options.push(GroupChoice::New);
@@ -4296,6 +4744,7 @@ impl Graph {
                     "Copy node, to paste here or in another drawing",
                     Some(GraphMsg::CopyNodes(vec![id])),
                 ),
+                self.sequence_picker(id),
                 Space::new().width(Length::Fill),
                 self.group_picker(id)
             ]
@@ -4526,13 +4975,10 @@ impl Graph {
             .iter()
             .zip(sections)
             .filter(|(node, _)| is_input(&node.kind))
-            .chain(
-                self.engine
-                    .nodes
-                    .iter()
-                    .zip(sections)
-                    .filter(|(node, _)| steps.get(&node.id).is_some_and(|step| *step < before)),
-            );
+            .chain(self.engine.nodes.iter().zip(sections).filter(|(node, _)| {
+                steps.get(&node.id).is_some_and(|step| *step < before)
+                    && self.node_sequence(node.id) == self.node_sequence(target.node)
+            }));
         for (node, node_sections) in candidates {
             let name = self.name(node.id);
             let name_match = name.to_lowercase().contains(&query);
@@ -5533,6 +5979,18 @@ impl Graph {
                     }
                 }
             }
+            Renaming::Sequence(id) => {
+                let taken = self.sequence_named(wanted).is_some_and(|other| other != id);
+                if !taken && self.sequence_name(id) != wanted {
+                    self.record();
+                    if self.sequences.is_empty() {
+                        self.sequences = self.sequence_list();
+                    }
+                    if let Some(sequence) = self.sequences.iter_mut().find(|s| s.id == id) {
+                        sequence.name = wanted.to_owned();
+                    }
+                }
+            }
             Renaming::Group(id) => {
                 if self.group(id).is_some_and(|group| group.name != wanted) {
                     self.record();
@@ -5559,6 +6017,44 @@ impl Graph {
                 self.find(0);
             }
             GraphMsg::NodeSearchStep(step) => self.find(*step),
+            GraphMsg::SequenceNew => {
+                self.record();
+                self.new_sequence(None);
+                self.revision += 1;
+            }
+            GraphMsg::SequenceActivate(id) => self.active_sequence = *id,
+            GraphMsg::SequenceRenameStart(id) => {
+                self.commit_rename();
+                self.renaming = Some((Renaming::Sequence(*id), self.sequence_name(*id)));
+            }
+            GraphMsg::SequenceCollapse(id) => {
+                if self.sequences.is_empty() {
+                    self.sequences = self.sequence_list();
+                }
+                if let Some(sequence) = self.sequences.iter_mut().find(|s| s.id == *id) {
+                    sequence.collapsed = !sequence.collapsed;
+                }
+            }
+            GraphMsg::MoveToSequence(id, to) => {
+                if self.node_sequence(*id) != Some(*to) {
+                    let links = self.sequence_move_breaks(*id, *to);
+                    if links.is_empty() {
+                        self.record();
+                        self.move_to_sequence(*id, *to);
+                    } else {
+                        self.confirm = Some(Confirm {
+                            action: GraphMsg::MoveToSequenceNow(*id, *to),
+                            node: *id,
+                            delete: false,
+                            links,
+                        });
+                    }
+                }
+            }
+            GraphMsg::MoveToSequenceNow(id, to) => {
+                self.record();
+                self.move_to_sequence(*id, *to);
+            }
             GraphMsg::ToggleCompact => self.compact = !self.compact,
             GraphMsg::ToggleSlider(id) => {
                 self.record();
@@ -6672,6 +7168,71 @@ mod tests {
         assert_eq!(import_name("Walls", false, &taken), "Walls 3");
         assert_eq!(import_name("Walls", true, &taken), "Walls");
         assert_eq!(import_name("Doors", false, &taken), "Doors");
+    }
+
+    #[test]
+    fn sequences_share_inputs_but_not_steps() {
+        let mut graph = Graph::default();
+        let size = graph.add_node(op("Number"), Vec::new());
+        let first = graph.add_node(op("Negate"), Vec::new());
+        assert_eq!(graph.node_sequence(first), Some(1));
+        assert_eq!(
+            graph.node_sequence(size),
+            None,
+            "inputs serve every sequence"
+        );
+        graph.update_ui(&GraphMsg::SequenceNew);
+        let second_sequence = graph.active();
+        assert_ne!(second_sequence, 1);
+        assert_eq!(graph.sequence_name(second_sequence), "Sequence 2");
+        let other = graph.add_node(op("Absolute"), Vec::new());
+        let later = graph.add_node(op("Negate"), Vec::new());
+        assert_eq!(graph.node_sequence(other), Some(second_sequence));
+        link(&mut graph, port(size, "value"), port(first, "x"));
+        link(&mut graph, port(size, "value"), port(other, "x"));
+        link(&mut graph, port(other, "result"), port(later, "x"));
+        assert!(graph.broken_links(&graph.steps()).is_empty());
+        // A link across sequences does not hold.
+        graph
+            .engine
+            .connect(port(first, "result"), port(later, "x"));
+        assert_eq!(graph.broken_links(&graph.steps()).len(), 1);
+        graph.prune_links();
+        assert!(!graph.engine.is_linked(&port(later, "x")));
+        link(&mut graph, port(other, "result"), port(later, "x"));
+
+        // Moving `other` away breaks the link `later` reads: asked first.
+        graph.update_ui(&GraphMsg::MoveToSequence(other, 1));
+        assert!(graph.confirm.is_some());
+        graph.confirm = None;
+        graph.update_ui(&GraphMsg::MoveToSequenceNow(other, 1));
+        assert_eq!(graph.sequence_steps(1), vec![first, other]);
+        assert!(
+            graph.engine.is_linked(&port(other, "x")),
+            "inputs still feed it"
+        );
+        // Moves stay within a sequence.
+        assert!(!graph.can_move(later, -1) && !graph.can_move(later, 1));
+
+        graph.update_ui(&GraphMsg::SequenceRenameStart(second_sequence));
+        graph.update_ui(&GraphMsg::RenameInput("Walls".into()));
+        graph.update_ui(&GraphMsg::RenameCommit);
+        let (loaded, _) = Graph::from_file(&graph.to_file("")).unwrap();
+        assert_eq!(loaded.sequence_named("walls"), Some(second_sequence));
+        assert_eq!(loaded.sequence_steps(second_sequence), vec![later]);
+        assert_eq!(loaded.active(), second_sequence);
+
+        // As the app deletes a sequence: one undo step, then the drop.
+        graph.record();
+        graph.drop_sequence(second_sequence);
+        assert_eq!(graph.sequence_list().len(), 1);
+        assert_eq!(
+            graph.node_sequence(later),
+            Some(1),
+            "orphans join the first"
+        );
+        graph.update_ui(&GraphMsg::Undo);
+        assert_eq!(graph.sequence_named("Walls"), Some(second_sequence));
     }
 
     #[test]

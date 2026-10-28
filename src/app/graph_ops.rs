@@ -39,6 +39,10 @@ const VERBS: &[&str] = &[
     "expand",
     "save_composite",
     "edit_script",
+    "add_sequence",
+    "rename_sequence",
+    "remove_sequence",
+    "run_sequence",
 ];
 
 /// A refused change.
@@ -270,6 +274,40 @@ fn script_api() -> Value {
         "errors": "A script that does not read is refused with invalid_script and its line; one that fails while running shows the reason in its issues.",
         "template": graph::script::TEMPLATE,
     })
+}
+
+/// The sequence of the step `after` names, if it names one.
+fn anchor_sequence(graph: &Graph, after: &Value) -> Option<crate::ui::node_graph::SequenceId> {
+    if after.as_str().map(str::trim) == Some("start") {
+        return None;
+    }
+    graph.node_sequence(resolve_node(graph, after).ok()?)
+}
+
+/// The sequence called `name`.
+fn resolve_sequence(
+    graph: &Graph,
+    name: &str,
+) -> Result<crate::ui::node_graph::SequenceId, ChangeError> {
+    graph.sequence_named(name).ok_or_else(|| {
+        fail_hint(
+            "unknown_sequence",
+            format!("No sequence is called {name}"),
+            "Read graph_state's sequences, or add one with add_sequence",
+        )
+    })
+}
+
+/// The sequence called `name`, added when there is none, without making
+/// it where new steps go.
+fn sequence_or_new(graph: &mut Graph, name: &str) -> crate::ui::node_graph::SequenceId {
+    if let Some(id) = graph.sequence_named(name) {
+        return id;
+    }
+    let active = graph.active();
+    let id = graph.new_sequence(Some(name));
+    graph.active_sequence = active;
+    id
 }
 
 /// A script read from `source`, refused with why when it does not read.
@@ -696,6 +734,12 @@ fn apply_one(
                 None => graph.unique_name(&kind_name(&kind), None, true),
             };
             let id = graph.add_named(kind, name.clone(), handles);
+            if let Some(wanted) = change["sequence"].as_str() {
+                let sequence = sequence_or_new(graph, wanted);
+                if let Some(ui) = graph.ui.get_mut(&id) {
+                    ui.sequence = sequence;
+                }
+            }
             if let Some(values) = change.get("values") {
                 let Some(values) = values.as_object() else {
                     return Err(fail("invalid_change", "values maps port names to values"));
@@ -709,6 +753,12 @@ fn apply_one(
                 let placed = place(graph, &mut nodes, id, after);
                 graph.engine.nodes = nodes;
                 placed?;
+                // A step placed after another joins that one's sequence.
+                if let Some(sequence) = anchor_sequence(graph, after) {
+                    if let Some(ui) = graph.ui.get_mut(&id) {
+                        ui.sequence = sequence;
+                    }
+                }
             }
             if let Some(group) = change["group"].as_str().map(str::trim) {
                 if !group.is_empty() {
@@ -794,6 +844,23 @@ fn apply_one(
                     ),
                 ));
             }
+            if let (Some(a), Some(b)) =
+                (graph.node_sequence(from.node), graph.node_sequence(to.node))
+            {
+                if a != b {
+                    return Err(fail_hint(
+                        "other_sequence",
+                        format!(
+                            "{} is in {} and {} in {}; a step reads only inputs and earlier steps of its own sequence",
+                            graph.name(from.node),
+                            graph.sequence_name(a),
+                            graph.name(to.node),
+                            graph.sequence_name(b)
+                        ),
+                        "Move one of them with move and sequence, or read the value from an input",
+                    ));
+                }
+            }
             let steps = graph.steps();
             let forward = match (steps.get(&from.node), steps.get(&to.node)) {
                 (Some(from), Some(to)) => from < to,
@@ -839,9 +906,49 @@ fn apply_one(
         }
         "move" => {
             let id = resolve_node(graph, &change["move"])?;
+            if let Some(wanted) = change["sequence"].as_str() {
+                if graph.node_sequence(id).is_none() {
+                    return Err(fail(
+                        "wrong_area",
+                        "Inputs serve every sequence; only steps move between them",
+                    ));
+                }
+                let to = resolve_sequence(graph, wanted)?;
+                let broken = graph.sequence_move_breaks(id, to);
+                let links: Vec<Value> = broken.iter().map(|link| link_json(graph, link)).collect();
+                if !broken.is_empty() && !force {
+                    return Err(ChangeError {
+                        links,
+                        ..fail_hint(
+                            "would_break_links",
+                            format!("Moving {} to {} breaks links", graph.name(id), wanted),
+                            "Pass \"force\": true to move it and clear those inputs",
+                        )
+                    });
+                }
+                graph.move_to_sequence(id, to);
+                result["links_dropped"] = json!(links);
+                if change.get("after").is_none() {
+                    result["node"] = json!(graph.name(id));
+                    report.results.push(result);
+                    return Ok(());
+                }
+            }
             let Some(after) = change.get("after") else {
-                return Err(fail("invalid_change", "Supply after: \"start\" or a node"));
+                return Err(fail(
+                    "invalid_change",
+                    "Supply after: \"start\" or a node, or sequence",
+                ));
             };
+            if anchor_sequence(graph, after)
+                .is_some_and(|other| Some(other) != graph.node_sequence(id))
+            {
+                return Err(fail_hint(
+                    "other_sequence",
+                    "after names a step of another sequence",
+                    "Pass sequence as well to move the step there first",
+                ));
+            }
             let mut nodes = graph.engine.nodes.clone();
             place(graph, &mut nodes, id, after)?;
             let order: Vec<(NodeId, &Kind)> =
@@ -1023,6 +1130,71 @@ fn apply_one(
                 .collect();
             result["node"] = json!(graph.name(id));
             result["links_dropped"] = json!(dropped);
+        }
+        "add_sequence" => {
+            let wanted = text_of(change, "add_sequence")?;
+            if graph.sequence_named(wanted).is_some() {
+                return Err(fail(
+                    "name_taken",
+                    format!("There is already a sequence called {wanted}"),
+                ));
+            }
+            let id = graph.new_sequence(Some(wanted));
+            result["sequence"] = json!(graph.sequence_name(id));
+        }
+        "rename_sequence" => {
+            let id = resolve_sequence(graph, text_of(change, "rename_sequence")?)?;
+            let wanted = text_of(change, "to")?.trim().to_owned();
+            if graph
+                .sequence_named(&wanted)
+                .is_some_and(|other| other != id)
+                || wanted.is_empty()
+            {
+                return Err(fail("name_taken", format!("{wanted} is taken or empty")));
+            }
+            if graph.sequences.is_empty() {
+                graph.sequences = graph.sequence_list();
+            }
+            if let Some(sequence) = graph.sequences.iter_mut().find(|s| s.id == id) {
+                sequence.name = wanted.clone();
+            }
+            result["sequence"] = json!(wanted);
+        }
+        "remove_sequence" => {
+            let id = resolve_sequence(graph, text_of(change, "remove_sequence")?)?;
+            if graph.sequence_list().len() < 2 {
+                return Err(fail("last_sequence", "A graph keeps at least one sequence"));
+            }
+            let steps = graph.sequence_steps(id);
+            if !steps.is_empty() && !force {
+                return Err(fail_hint(
+                    "would_remove_steps",
+                    format!("{} holds {} steps", graph.sequence_name(id), steps.len()),
+                    "Pass \"force\": true to remove it with its steps",
+                ));
+            }
+            result["removed"] = json!(steps
+                .iter()
+                .map(|step| graph.name(*step))
+                .collect::<Vec<_>>());
+            for step in steps {
+                report.removed.extend(graph.remove_node(step));
+            }
+            graph.drop_sequence(id);
+        }
+        "run_sequence" => {
+            let wanted = text_of(change, "run_sequence")?;
+            let steps = if wanted.trim().eq_ignore_ascii_case("all") {
+                graph.engine.nodes.iter().map(|node| node.id).collect()
+            } else {
+                graph.sequence_steps(resolve_sequence(graph, wanted)?)
+            };
+            for id in &steps {
+                if let Some(node) = graph.engine.node_mut(*id) {
+                    node.memo = None;
+                }
+            }
+            result["steps"] = json!(steps.len());
         }
         _ => unreachable!("verbs are listed above"),
     }
@@ -1285,15 +1457,28 @@ impl OpenCADStudio {
                 &mut sequence
             };
             let position = list.len() + 1;
-            list.push(node_json(
-                graph,
-                &drawing,
-                node,
-                node_sections,
-                position,
-                summary,
-            ));
+            let mut value = node_json(graph, &drawing, node, node_sections, position, summary);
+            if let Some(id) = graph.node_sequence(node.id) {
+                value["sequence"] = json!(graph.sequence_name(id));
+            }
+            list.push(value);
         }
+        let active = graph.active();
+        let sequences: Vec<Value> = graph
+            .sequence_list()
+            .iter()
+            .map(|sequence| {
+                json!({
+                    "name": sequence.name,
+                    "active": sequence.id == active,
+                    "steps": graph
+                        .sequence_steps(sequence.id)
+                        .iter()
+                        .map(|id| graph.name(*id))
+                        .collect::<Vec<_>>(),
+                })
+            })
+            .collect();
         let groups: Vec<Value> = graph
             .groups
             .iter()
@@ -1312,6 +1497,7 @@ impl OpenCADStudio {
             "graph_revision": graph.revision,
             "inputs": inputs,
             "sequence": sequence,
+            "sequences": sequences,
             "groups": groups,
             "steps_hidden": graph.steps_hidden,
         })
@@ -2205,6 +2391,72 @@ mod tests {
         assert!(app.tabs[i].graph.scripts_paused);
         let state = read(&mut app, "graph_state", json!({}));
         assert_eq!(port_value(&state, "Strange", "y"), Value::Null, "not run");
+    }
+
+    /// Two sequences read one input; a step of one cannot read the other's,
+    /// and running a sequence rereads the file it reads.
+    #[test]
+    fn sequences_by_automation_and_rerunning_a_file() {
+        let mut app = app();
+        let i = app.active_tab;
+        let csv = std::env::temp_dir().join(format!("ocs-seq-{}.csv", std::process::id()));
+        std::fs::write(&csv, "x\n1\n2\n").unwrap();
+        let built = apply_changes(
+            &mut app,
+            "q1",
+            json!([
+                {"add": "Text", "source": "builtin", "name": "File", "values": {"value": csv.to_string_lossy()}},
+                {"add": "Number", "name": "K", "values": {"value": 3}},
+                {"add": "Negate", "name": "Main step"},
+                {"link": "K.value", "to": "Main step.x"},
+                {"add_sequence": "Data"},
+                {"add": "Read CSV", "name": "Points", "sequence": "Data"},
+                {"link": "File.value", "to": "Points.path"},
+                {"add": "Sum", "name": "Total", "sequence": "Data"},
+                {"link": "Points.column 1", "to": "Total.list"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(state["sequences"][1]["name"], "Data");
+        assert_eq!(state["sequences"][1]["steps"], json!(["Points", "Total"]));
+        assert_eq!(node(&state, "sequence", "Total")["sequence"], "Data");
+        assert_eq!(
+            node(&state, "sequence", "Main step")["sequence"],
+            "Sequence 1"
+        );
+        assert_eq!(port_value(&state, "Total", "result"), json!(3.0));
+
+        let across = apply_changes(
+            &mut app,
+            "q2",
+            json!([{"link": "Main step.result", "to": "Total.list"}]),
+        );
+        assert_eq!(across["code"], "other_sequence", "{across}");
+
+        std::fs::write(&csv, "x\n10\n20\n30\n").unwrap();
+        let data = app.tabs[i].graph.sequence_named("Data").unwrap();
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::SequenceRun(data));
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Total", "result"), json!(60.0));
+
+        let moved = apply_changes(
+            &mut app,
+            "q3",
+            json!([{"move": "Total", "sequence": "Sequence 1"}]),
+        );
+        assert_eq!(moved["code"], "would_break_links", "{moved}");
+        let refused = apply_changes(&mut app, "q4", json!([{"remove_sequence": "Data"}]));
+        assert_eq!(refused["code"], "would_remove_steps");
+        let removed = apply_changes(
+            &mut app,
+            "q5",
+            json!([{"remove_sequence": "Data", "force": true}]),
+        );
+        assert_eq!(removed["ok"], true, "{removed}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(state["sequences"].as_array().map(Vec::len), Some(1));
+        let _ = std::fs::remove_file(&csv);
     }
 
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {

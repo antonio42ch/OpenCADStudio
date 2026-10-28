@@ -789,6 +789,47 @@ impl OpenCADStudio {
                     crate::ui::node_graph::RENAME_ID,
                 ));
             }
+            GraphMsg::SequenceDelete(sequence) => {
+                let graph = &mut self.tabs[i].graph;
+                if graph.sequence_list().len() < 2 {
+                    return Task::none();
+                }
+                graph.record();
+                let mut handles = Vec::new();
+                for id in graph.sequence_steps(sequence) {
+                    handles.extend(graph.remove_node(id));
+                }
+                graph.drop_sequence(sequence);
+                return self.graph_step(i, |app| {
+                    app.graph_erase(i, handles);
+                    Vec::new()
+                });
+            }
+            // Every node of the sequence runs again: files and drawn objects
+            // are read anew, and nothing kept from the last run is reused.
+            GraphMsg::SequenceRun(sequence) => {
+                let graph = &mut self.tabs[i].graph;
+                for id in graph.sequence_steps(sequence) {
+                    if let Some(node) = graph.engine.node_mut(id) {
+                        node.memo = None;
+                    }
+                }
+                return self.graph_run(i);
+            }
+            GraphMsg::RunAll => {
+                self.tabs[i].graph.engine.invalidate();
+                return self.graph_run(i);
+            }
+            GraphMsg::MoveToSequence(..) | GraphMsg::MoveToSequenceNow(..) => {
+                if self.tabs[i].graph.confirm.is_none() {
+                    return self.graph_run(i);
+                }
+            }
+            GraphMsg::SequenceRenameStart(_) => {
+                return iced::widget::operation::focus(iced::widget::Id::new(
+                    crate::ui::node_graph::RENAME_ID,
+                ));
+            }
             GraphMsg::NodeDelete(id) | GraphMsg::DeleteNow(id) => {
                 // A node others read from waits for confirmation.
                 if self.tabs[i].graph.confirm.is_some() {
