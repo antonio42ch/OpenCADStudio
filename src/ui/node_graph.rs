@@ -2756,7 +2756,13 @@ impl Graph {
             swatch,
             name,
             text(size.into_owned()).size(10).style(weak_text),
-            Space::new().width(Length::Fill),
+            // A filling space on the node sequence would make the whole
+            // track fill the viewport and stop it scrolling sideways.
+            if group.inputs {
+                Space::new().width(Length::Fill)
+            } else {
+                Space::new().width(12)
+            },
             icon_button(
                 crate::ui::icons::NODE_GRAPH,
                 "Make a composite node of this group",
