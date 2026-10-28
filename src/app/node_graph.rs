@@ -342,12 +342,30 @@ impl OpenCADStudio {
                     .find(|(field, _)| field == name)
                     .map(|(_, value)| value.clone())
             };
-            let document = &self.tabs[i].scene.document;
-            let entities = place_entities(kind, &get, document);
+            // A layer or linetype named but not in the drawing yet is added,
+            // so a graph can sort what it draws onto layers of its own.
             let layer = get("layer")
                 .map(|value| graph::value::text(&value).trim().to_owned())
-                .filter(|name| document.layers.get(name).is_some())
+                .filter(|name| !name.is_empty())
                 .unwrap_or_else(|| self.tabs[i].active_layer.clone());
+            let linetype = get("linetype")
+                .map(|value| graph::value::text(&value).trim().to_owned())
+                .filter(|name| !name.is_empty() && !name.eq_ignore_ascii_case("ByLayer"));
+            let line_weight = get("lineweight")
+                .as_ref()
+                .and_then(graph::value::num)
+                .filter(|mm| *mm >= 0.0)
+                .map_or(codec::types::LineWeight::ByLayer, |mm| {
+                    codec::types::LineWeight::from_value((mm * 100.0).round().min(211.0) as i16)
+                });
+            self.tabs[i].scene.ensure_layer(&layer);
+            let linetype = linetype.filter(|name| {
+                let document = &mut self.tabs[i].scene.document;
+                document.line_types.contains(name)
+                    || crate::io::linetypes::ensure_catalog_linetype(document, name)
+            });
+            let document = &self.tabs[i].scene.document;
+            let entities = place_entities(kind, &get, document);
             let color = match get("color") {
                 Some(Value::Number(index)) => index
                     .as_i64()
@@ -355,6 +373,13 @@ impl OpenCADStudio {
                         codec::types::Color::from_index(index as i16)
                     }),
                 _ => codec::types::Color::ByLayer,
+            };
+            let style = |entity: &mut codec::EntityType| {
+                let common = entity.common_mut();
+                common.layer = layer.clone();
+                common.color = color;
+                common.linetype = linetype.clone().unwrap_or_default();
+                common.line_weight = line_weight;
             };
             let mut objects = Vec::new();
             for mut entity in entities {
@@ -370,15 +395,13 @@ impl OpenCADStudio {
                         if let Some(existing) = self.tabs[i].scene.document.get_entity(handle) {
                             *entity.common_mut() = existing.common().clone();
                         }
-                        entity.common_mut().layer = layer.clone();
-                        entity.common_mut().color = color;
+                        style(&mut entity);
                         self.tabs[i].scene.update_entity(entity);
                         handle
                     }
                     None => {
                         entity.common_mut().handle = Handle::NULL;
-                        entity.common_mut().layer = layer.clone();
-                        entity.common_mut().color = color;
+                        style(&mut entity);
                         let Some(handle) = self.commit_entity_handle_preserve_style(entity) else {
                             continue;
                         };
@@ -399,7 +422,12 @@ impl OpenCADStudio {
             };
             let mut result: Vec<(String, Value)> = fields
                 .iter()
-                .filter(|(field, _)| !matches!(field.as_str(), "layer" | "color" | "object"))
+                .filter(|(field, _)| {
+                    !matches!(
+                        field.as_str(),
+                        "layer" | "color" | "linetype" | "lineweight" | "object"
+                    )
+                })
                 .cloned()
                 .collect();
             result.extend([
@@ -408,6 +436,17 @@ impl OpenCADStudio {
                     "color".to_owned(),
                     match color {
                         codec::types::Color::Index(index) => json!(index),
+                        _ => json!("ByLayer"),
+                    },
+                ),
+                (
+                    "linetype".to_owned(),
+                    json!(linetype.clone().unwrap_or_else(|| "ByLayer".to_owned())),
+                ),
+                (
+                    "lineweight".to_owned(),
+                    match line_weight {
+                        codec::types::LineWeight::Value(value) => json!(f64::from(value) / 100.0),
                         _ => json!("ByLayer"),
                     },
                 ),
@@ -427,6 +466,37 @@ impl OpenCADStudio {
 
     fn graph_run(&mut self, i: usize) -> Task<Message> {
         self.graph_step(i, |_| Vec::new())
+    }
+
+    /// Runs the active graph again when what its Layer Objects nodes read
+    /// has changed since the last edit: objects drawn, edited or erased on a
+    /// watched layer. Undo and redo leave it be (see `graph_follow_absorb`),
+    /// as they bring back the graph's output with the drawing.
+    pub(super) fn graph_follow_drawing(&mut self) -> Task<Message> {
+        let i = self.active_tab;
+        let Some(tab) = self.tabs.get(i) else {
+            return Task::none();
+        };
+        if tab.graph.followed_revision == tab.edit_revision {
+            return Task::none();
+        }
+        let fingerprint = watched_fingerprint(tab);
+        let changed = fingerprint.is_some() && fingerprint != tab.graph.watched;
+        self.tabs[i].graph.followed_revision = self.tabs[i].edit_revision;
+        if !changed {
+            return Task::none();
+        }
+        let task = self.graph_run(i);
+        self.tabs[i].graph.watched = watched_fingerprint(&self.tabs[i]);
+        task
+    }
+
+    /// Takes the drawing as the graph's Layer Objects nodes now see it,
+    /// without running the graph.
+    pub(super) fn graph_follow_absorb(&mut self, i: usize) {
+        let tab = &mut self.tabs[i];
+        tab.graph.watched = watched_fingerprint(tab);
+        tab.graph.followed_revision = tab.edit_revision;
     }
 
     pub(super) fn on_graph(&mut self, message: GraphMsg) -> Task<Message> {
@@ -465,6 +535,64 @@ impl OpenCADStudio {
             | GraphMsg::MoveToNow(..) => {
                 if self.tabs[i].graph.confirm.is_none() {
                     return self.graph_run(i);
+                }
+            }
+            GraphMsg::ToggleSlider(_) => return self.graph_run(i),
+            GraphMsg::NodeSearch(_) | GraphMsg::NodeSearchStep(_) => {
+                self.graph_refresh_preview();
+                let Some((input, along)) = self.tabs[i].graph.found_place() else {
+                    return Task::none();
+                };
+                let (id, offset) = if input {
+                    (
+                        crate::ui::node_graph::INPUTS_SCROLL_ID,
+                        iced::widget::scrollable::RelativeOffset {
+                            x: None,
+                            y: Some(along),
+                        },
+                    )
+                } else {
+                    (
+                        crate::ui::node_graph::SEQUENCE_SCROLL_ID,
+                        iced::widget::scrollable::RelativeOffset {
+                            x: Some(along),
+                            y: None,
+                        },
+                    )
+                };
+                return iced::widget::operation::snap_to(iced::widget::Id::new(id), offset);
+            }
+            GraphMsg::CopyNodes(ids) => {
+                if ids.is_empty() {
+                    return Task::none();
+                }
+                let text = self.tabs[i].graph.copy_text(&ids);
+                self.command_line
+                    .push_info(crate::tf!("{} nodes copied", ids.len()).as_ref());
+                return iced::clipboard::write(text).discard();
+            }
+            GraphMsg::Paste => {
+                #[cfg(target_arch = "wasm32")]
+                return Task::perform(crate::sys::read_clipboard_text(), |text| {
+                    Message::Graph(GraphMsg::Pasted(text))
+                });
+                #[cfg(not(target_arch = "wasm32"))]
+                return iced::clipboard::read_text().map(|result| {
+                    Message::Graph(GraphMsg::Pasted(result.ok().map(|text| (*text).clone())))
+                });
+            }
+            GraphMsg::Pasted(text) => {
+                match self.tabs[i]
+                    .graph
+                    .paste_text(text.as_deref().unwrap_or_default())
+                {
+                    Ok(added) => {
+                        self.tabs[i].graph.steps_hidden = false;
+                        self.command_line
+                            .push_output(crate::tf!("{} nodes pasted", added.len()).as_ref());
+                        return self.graph_run(i);
+                    }
+                    Err(error) => self.command_line.push_error(&error),
                 }
             }
             GraphMsg::ConfirmYes => {
@@ -899,6 +1027,71 @@ impl graph::Host for AppHost<'_> {
     fn expression(&self, text: &str) -> Option<f64> {
         crate::app::expr_eval::eval_number(text)
     }
+
+    fn layer_objects(&self, layer: &str, kind: &str) -> Vec<Value> {
+        watched_objects(&self.app.tabs[self.i], layer, kind)
+            .map(|entity| json!({ "handle": entity.common().handle.value() }))
+            .collect()
+    }
+}
+
+/// The drawn objects a Layer Objects node reads: those on `layer` (any
+/// when empty) of the object type `kind` (any when empty), leaving out what
+/// the graph draws itself.
+fn watched_objects<'t>(
+    tab: &'t crate::app::document::DocumentTab,
+    layer: &str,
+    kind: &str,
+) -> impl Iterator<Item = &'t codec::EntityType> {
+    let owned: std::collections::HashSet<Handle> = tab.graph.owned_handles().into_iter().collect();
+    let kind = (!kind.is_empty()).then(|| {
+        crate::ui::node_graph::OBJECTS
+            .iter()
+            .copied()
+            .find(|object| object.name().eq_ignore_ascii_case(kind))
+    });
+    let layer = layer.to_owned();
+    tab.scene.document.entities().filter(move |entity| {
+        let common = entity.common();
+        kind != Some(None)
+            && (layer.is_empty() || common.layer.eq_ignore_ascii_case(&layer))
+            && !owned.contains(&common.handle)
+            && kind.flatten().is_none_or(|kind| kind.matches(entity))
+    })
+}
+
+/// A fingerprint of everything the graph's Layer Objects nodes read, or
+/// `None` when it has none: when it changes the graph has to run again.
+pub(super) fn watched_fingerprint(tab: &crate::app::document::DocumentTab) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let texts = |value: Value| -> Vec<String> {
+        match value {
+            Value::Array(items) => items.iter().map(graph::value::text).collect(),
+            other => vec![graph::value::text(&other)],
+        }
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut any = false;
+    for node in &tab.graph.engine.nodes {
+        if !matches!(&node.kind, Kind::Op(spec) if spec.name == "Layer Objects") {
+            continue;
+        }
+        any = true;
+        let input = |field: &str| {
+            tab.graph.engine.input(&Port {
+                node: node.id,
+                field: field.to_owned(),
+            })
+        };
+        for layer in texts(input("layer")) {
+            for kind in texts(input("type")) {
+                for entity in watched_objects(tab, layer.trim(), kind.trim()) {
+                    format!("{entity:?}").hash(&mut hasher);
+                }
+            }
+        }
+    }
+    any.then(|| hasher.finish())
 }
 
 /// Every curve in `value`, through nested lists.
@@ -916,8 +1109,8 @@ fn is_placing(kind: &Kind) -> bool {
 }
 
 /// A placing node's rows: field, label, whether it is an input, and the
-/// kind of value it takes. Every one ends with the layer and colour it
-/// draws on, and the entities it drew.
+/// kind of value it takes. Every one ends with the layer, colour, linetype
+/// and lineweight (in millimetres) it draws with, and the entities it drew.
 fn place_fields(kind: ObjectKind) -> Vec<(&'static str, &'static str, bool, Type, bool)> {
     let mut fields = vec![("object", "Object", false, Type::Object, false)];
     fields.extend_from_slice(match kind {
@@ -943,6 +1136,8 @@ fn place_fields(kind: ObjectKind) -> Vec<(&'static str, &'static str, bool, Type
     });
     fields.push(("layer", "Layer", true, Type::Text, false));
     fields.push(("color", "Color", true, Type::Number, false));
+    fields.push(("linetype", "Linetype", true, Type::Text, false));
+    fields.push(("lineweight", "Lineweight", true, Type::Number, false));
     fields
 }
 

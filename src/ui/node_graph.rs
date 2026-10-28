@@ -49,6 +49,17 @@ const HISTORY: usize = 100;
 /// Text inputs the app focuses when the picker or a rename opens.
 pub const PICK_SEARCH_ID: &str = "node-graph-pick-search";
 pub const RENAME_ID: &str = "node-graph-rename";
+pub const NODE_SEARCH_ID: &str = "node-graph-node-search";
+/// The scrollables of the node sequence and of the Inputs area, so a
+/// found node can be brought into view.
+pub const SEQUENCE_SCROLL_ID: &str = "node-graph-sequence";
+pub const INPUTS_SCROLL_ID: &str = "node-graph-inputs";
+/// Width of a step in the compact view.
+const COMPACT_W: f32 = 200.0;
+/// Section key of a slider's range rows.
+const RANGE_SECTION: &str = "\u{1}range";
+/// The `format` of copied nodes on the clipboard.
+const CLIP_FORMAT: &str = "ocg-nodes";
 
 /// Operations that live in the Inputs area: the only nodes whose values are
 /// typed by hand.
@@ -90,7 +101,7 @@ pub enum ObjectKind {
     Dimension,
 }
 
-const OBJECTS: &[ObjectKind] = &[
+pub const OBJECTS: &[ObjectKind] = &[
     ObjectKind::Line,
     ObjectKind::Circle,
     ObjectKind::Arc,
@@ -1033,6 +1044,15 @@ pub struct Graph {
     pub revision: u64,
     /// Hides the viewport preview of the curves nodes compute.
     pub preview_hidden: bool,
+    /// The drawing's edit revision the graph last checked its Layer Objects
+    /// nodes against, and the fingerprint of what they read then.
+    pub followed_revision: u64,
+    pub watched: Option<u64>,
+    /// Text typed into the node sequence's find box, and the match shown.
+    node_search: String,
+    pub found: Option<NodeId>,
+    /// Steps show as small cards with their results only.
+    pub compact: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1108,6 +1128,18 @@ pub enum GraphMsg {
     /// Text pasted into a table's paste box: rows of tab-, semicolon- or
     /// comma-separated cells replace the table.
     TablePaste(Port, String),
+    /// Text typed into the find box; the first match is shown.
+    NodeSearch(String),
+    /// Shows the next (1) or previous (-1) match.
+    NodeSearchStep(i32),
+    ToggleCompact,
+    /// Turns a Number into a slider, or a slider back into a Number.
+    ToggleSlider(NodeId),
+    /// Puts nodes, with the links among them, on the clipboard.
+    CopyNodes(Vec<NodeId>),
+    /// Reads the clipboard to paste the nodes on it.
+    Paste,
+    Pasted(Option<String>),
     /// Start an empty graph; the drawing keeps the old graph's objects.
     New,
     Save,
@@ -1377,6 +1409,7 @@ impl Graph {
                 "zoom": self.zoom_steps,
                 "steps_hidden": self.steps_hidden,
                 "preview_hidden": self.preview_hidden,
+                "compact": self.compact,
                 "groups": groups,
                 "nodes": nodes,
             },
@@ -1412,6 +1445,7 @@ impl Graph {
         });
         graph.steps_hidden = canvas["steps_hidden"].as_bool().unwrap_or(false);
         graph.preview_hidden = canvas["preview_hidden"].as_bool().unwrap_or(false);
+        graph.compact = canvas["compact"].as_bool().unwrap_or(false);
         for group in canvas["groups"].as_array().into_iter().flatten() {
             let (Some(id), Some(name)) = (group["id"].as_u64(), group["name"].as_str()) else {
                 continue;
@@ -1649,6 +1683,271 @@ impl Graph {
             );
         }
         Some(copy)
+    }
+
+    /// Nodes whose name or type holds the find box's text, in node order.
+    pub(crate) fn search_matches(&self) -> Vec<NodeId> {
+        let query = self.node_search.trim().to_lowercase();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        self.engine
+            .nodes
+            .iter()
+            .filter(|node| {
+                self.name(node.id).to_lowercase().contains(&query)
+                    || kind_name(&node.kind).to_lowercase().contains(&query)
+            })
+            .map(|node| node.id)
+            .collect()
+    }
+
+    /// Shows match `step` places after the current one, opening its group.
+    fn find(&mut self, step: i32) {
+        let matches = self.search_matches();
+        let current = self
+            .found
+            .and_then(|id| matches.iter().position(|found| *found == id));
+        self.found = match (current, matches.len() as i32) {
+            (_, 0) => None,
+            (None, _) => matches.first().copied(),
+            (Some(k), len) => Some(matches[(k as i32 + step).rem_euclid(len) as usize]),
+        };
+        if let Some(group) = self.found.and_then(|id| self.node_group(id)) {
+            if let Some(group) = self.groups.iter_mut().find(|g| g.id == group) {
+                group.collapsed = false;
+            }
+        }
+        self.hovered = self.found;
+    }
+
+    /// Where the found node sits: whether it is an input, and how far along
+    /// its area it is, from 0 (first) to 1 (last).
+    pub fn found_place(&self) -> Option<(bool, f32)> {
+        let id = self.found?;
+        let input = is_input(&self.engine.node(id)?.kind);
+        let area: Vec<NodeId> = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| is_input(&node.kind) == input)
+            .map(|node| node.id)
+            .collect();
+        let k = area.iter().position(|other| *other == id)?;
+        Some((input, k as f32 / (area.len().max(2) - 1) as f32))
+    }
+
+    /// Nodes `ids` as clipboard text: the nodes, the links among them, their
+    /// names and groups, and the links from other nodes by those nodes'
+    /// names, so a paste into a graph with nodes of the same names relinks
+    /// them.
+    pub fn copy_text(&self, ids: &[NodeId]) -> String {
+        let keep: HashSet<NodeId> = ids.iter().copied().collect();
+        let mut part = graph::Graph::default();
+        part.nodes = self
+            .engine
+            .nodes
+            .iter()
+            .filter(|node| keep.contains(&node.id))
+            .cloned()
+            .collect();
+        let (inner, outer): (Vec<&Link>, Vec<&Link>) = self
+            .engine
+            .links
+            .iter()
+            .filter(|link| keep.contains(&link.to.node))
+            .partition(|link| keep.contains(&link.from.node));
+        part.links = inner.into_iter().cloned().collect();
+        let names: serde_json::Map<String, Value> = ids
+            .iter()
+            .map(|id| (id.to_string(), json!(self.name(*id))))
+            .collect();
+        let groups: serde_json::Map<String, Value> = ids
+            .iter()
+            .filter_map(|id| {
+                let group = self.group(self.node_group(*id)?)?;
+                Some((
+                    id.to_string(),
+                    json!({ "id": group.id, "name": group.name, "color": group.color, "inputs": group.inputs }),
+                ))
+            })
+            .collect();
+        let outer: Vec<Value> = outer
+            .into_iter()
+            .map(|link| {
+                json!({
+                    "from": self.name(link.from.node),
+                    "field": link.from.field,
+                    "node": link.to.node,
+                    "to": link.to.field,
+                })
+            })
+            .collect();
+        serde_json::to_string(&json!({
+            "format": CLIP_FORMAT,
+            "graph": part.to_json(),
+            "names": names,
+            "groups": groups,
+            "outer": outer,
+        }))
+        .unwrap_or_default()
+    }
+
+    /// Adds the nodes in clipboard text written by
+    /// [`copy_text`](Self::copy_text): inputs to the Inputs area, steps to
+    /// the end of the node sequence, each in a new group of its own where
+    /// they had one. Returns the new nodes.
+    pub fn paste_text(&mut self, text: &str) -> Result<Vec<NodeId>, String> {
+        let clip: Value = serde_json::from_str(text.trim())
+            .map_err(|_| t!("The clipboard holds no nodes").into_owned())?;
+        if clip["format"] != CLIP_FORMAT {
+            return Err(t!("The clipboard holds no nodes").into_owned());
+        }
+        let part = graph::Graph::from_json(&clip["graph"])?;
+        if part.nodes.is_empty() {
+            return Err(t!("The clipboard holds no nodes").into_owned());
+        }
+        self.record();
+        let mut map: HashMap<NodeId, NodeId> = HashMap::default();
+        let mut groups: HashMap<u64, GroupId> = HashMap::default();
+        for node in part.nodes {
+            let base = clip["names"][node.id.to_string()]
+                .as_str()
+                .map_or_else(|| kind_name(&node.kind), str::to_owned);
+            let name = self.unique_name(&base, None, false);
+            let id = self.add_named(node.kind, name, Vec::new());
+            if let Some(copy) = self.engine.node_mut(id) {
+                copy.params = node.params;
+            }
+            let group = &clip["groups"][node.id.to_string()];
+            if let Some(old) = group["id"].as_u64() {
+                let new = match groups.get(&old) {
+                    Some(new) => *new,
+                    None => {
+                        let new = self.groups.iter().map(|g| g.id).max().unwrap_or(0) + 1;
+                        let name = group["name"].as_str().unwrap_or_default();
+                        self.groups.push(NodeGroup {
+                            id: new,
+                            name: self.unique_group_name(name),
+                            color: group["color"].as_u64().unwrap_or(0) as usize,
+                            collapsed: false,
+                            inputs: group["inputs"].as_bool().unwrap_or(false),
+                        });
+                        groups.insert(old, new);
+                        new
+                    }
+                };
+                if let Some(ui) = self.ui.get_mut(&id) {
+                    ui.group = Some(new);
+                }
+            }
+            map.insert(node.id, id);
+        }
+        for link in part.links {
+            if let (Some(from), Some(to)) = (map.get(&link.from.node), map.get(&link.to.node)) {
+                self.engine.connect(
+                    Port {
+                        node: *from,
+                        field: link.from.field,
+                    },
+                    Port {
+                        node: *to,
+                        field: link.to.field,
+                    },
+                );
+            }
+        }
+        let pasted: HashSet<NodeId> = map.values().copied().collect();
+        for link in clip["outer"].as_array().into_iter().flatten() {
+            let (Some(from), Some(field), Some(to), Some(port)) = (
+                link["from"].as_str(),
+                link["field"].as_str(),
+                link["node"]
+                    .as_u64()
+                    .and_then(|id| map.get(&(id as NodeId))),
+                link["to"].as_str(),
+            ) else {
+                continue;
+            };
+            let source = self.engine.nodes.iter().find(|node| {
+                !pasted.contains(&node.id) && self.name(node.id).eq_ignore_ascii_case(from)
+            });
+            if let Some(source) = source.map(|node| node.id) {
+                self.engine.connect(
+                    Port {
+                        node: source,
+                        field: field.to_owned(),
+                    },
+                    Port {
+                        node: *to,
+                        field: port.to_owned(),
+                    },
+                );
+            }
+        }
+        // Inputs gather with the inputs; the steps follow the last step.
+        self.engine.nodes.sort_by_key(|node| !is_input(&node.kind));
+        self.prune_links();
+        self.revision += 1;
+        let mut added: Vec<NodeId> = map.into_values().collect();
+        added.sort_unstable();
+        Ok(added)
+    }
+
+    /// `base`, or `base 2`, `base 3`… when a group already has that name.
+    fn unique_group_name(&self, base: &str) -> String {
+        let taken = |name: &str| {
+            self.groups
+                .iter()
+                .any(|g| g.name.eq_ignore_ascii_case(name))
+        };
+        if !taken(base) {
+            return base.to_owned();
+        }
+        (2..)
+            .map(|n| format!("{base} {n}"))
+            .find(|name| !taken(name))
+            .unwrap_or_default()
+    }
+
+    /// Turns a Number input into a Number Slider around its value, or a
+    /// slider back into a Number; its links and name stay.
+    fn toggle_slider(&mut self, id: NodeId) {
+        let Some(node) = self.engine.node_mut(id) else {
+            return;
+        };
+        let value = node
+            .params
+            .get("value")
+            .and_then(graph::value::num)
+            .unwrap_or(0.0);
+        let (name, range) = match &node.kind {
+            Kind::Op(spec) if spec.name == "Number" => {
+                let span = value.abs().max(1.0) * 2.0;
+                let (min, max) = if value >= 0.0 {
+                    (0.0, span)
+                } else {
+                    (-span, 0.0)
+                };
+                ("Number Slider", Some((min, max, span / 100.0)))
+            }
+            Kind::Op(spec) if matches!(spec.name, "Number Slider" | "Integer Slider") => {
+                ("Number", None)
+            }
+            _ => return,
+        };
+        let Some(spec) = graph::spec(name) else {
+            return;
+        };
+        node.kind = Kind::Op(spec);
+        node.params.retain(|field, _| field == "value");
+        if let Some((min, max, step)) = range {
+            for (field, x) in [("min", min), ("max", max), ("step", step)] {
+                node.params
+                    .insert(field.to_owned(), graph::value::number(x));
+            }
+        }
+        self.revision += 1;
     }
 
     /// Position of every step in the node sequence.
@@ -2462,6 +2761,7 @@ impl Graph {
                     bottom: 0.0,
                     left: 0.0,
                 }))
+                .id(iced::widget::Id::new(INPUTS_SCROLL_ID))
                 .height(Length::Fill),
             ]
             .spacing(8),
@@ -2541,7 +2841,46 @@ impl Graph {
         let zoom_button = |icon: &'static [u8], tip: &str, steps: i32, enabled: bool| {
             icon_button(icon, tip, enabled.then_some(GraphMsg::Zoom(steps)))
         };
+        let matches = self.search_matches();
+        let mut finder = row![
+            crate::ui::icons::themed(crate::ui::icons::SEARCH, 11.0),
+            text_input(&t!("Find node"), &self.node_search)
+                .id(iced::widget::Id::new(NODE_SEARCH_ID))
+                .on_input(|value| msg(GraphMsg::NodeSearch(value)))
+                .on_submit(msg(GraphMsg::NodeSearchStep(1)))
+                .size(11)
+                .padding([3, 5])
+                .width(130),
+        ]
+        .spacing(4)
+        .align_y(iced::Center);
+        if !self.node_search.trim().is_empty() {
+            let position = self
+                .found
+                .and_then(|id| matches.iter().position(|found| *found == id));
+            finder = finder.push(
+                text(match position {
+                    Some(k) => format!("{}/{}", k + 1, matches.len()),
+                    None => t!("No match").into_owned(),
+                })
+                .size(10)
+                .style(weak_text),
+            );
+            let several = matches.len() > 1;
+            finder = finder.push(icon_button(
+                crate::ui::icons::TRI_LEFT,
+                "Previous match",
+                several.then_some(GraphMsg::NodeSearchStep(-1)),
+            ));
+            finder = finder.push(icon_button(
+                crate::ui::icons::TRI_RIGHT,
+                "Next match (Enter)",
+                several.then_some(GraphMsg::NodeSearchStep(1)),
+            ));
+        }
         let toolbar = row![
+            finder,
+            Space::new().width(10),
             tooltip(
                 button(
                     row![
@@ -2560,7 +2899,33 @@ impl Graph {
                 tooltip::Position::Bottom,
             )
             .gap(4),
+            tooltip(
+                button(text(t!("Paste nodes")).size(11))
+                    .on_press(msg(GraphMsg::Paste))
+                    .style(button::secondary)
+                    .padding([3, 8]),
+                container(
+                    text(t!("Add the nodes copied with their copy button, from this graph or another drawing")).size(10)
+                )
+                .padding([2, 6])
+                .style(container::bordered_box),
+                tooltip::Position::Bottom,
+            )
+            .gap(4),
             Space::new().width(10),
+            icon_button(
+                if self.compact {
+                    crate::ui::icons::GRID
+                } else {
+                    crate::ui::icons::LIST
+                },
+                if self.compact {
+                    "Full cards"
+                } else {
+                    "Compact cards: results only"
+                },
+                Some(GraphMsg::ToggleCompact)
+            ),
             icon_button(
                 crate::ui::icons::PREVIEW,
                 if self.preview_hidden {
@@ -2612,6 +2977,7 @@ impl Graph {
                 bottom: 4.0,
                 left: 0.0,
             }))
+            .id(iced::widget::Id::new(SEQUENCE_SCROLL_ID))
             .direction(scrollable::Direction::Both {
                 vertical: scrollable::Scrollbar::default(),
                 horizontal: scrollable::Scrollbar::default(),
@@ -2654,14 +3020,22 @@ impl Graph {
     /// accent while one is.
     fn hover_target<'a>(&self, id: NodeId, card: Element<'a, Message>) -> Element<'a, Message> {
         let target = self.dragging.is_some_and(|dragged| dragged != id) && self.hovered == Some(id);
+        // The node the find box shows is ringed; its other matches edged.
+        let found = self.found == Some(id);
+        let matched = !found && self.search_matches().contains(&id);
         let framed = container(card).padding(2).style(move |theme: &Theme| {
-            if !target {
+            let primary = theme.palette().primary;
+            let (color, width) = if target || found {
+                (primary.base.color, 2.0)
+            } else if matched {
+                (primary.base.color.scale_alpha(0.45), 1.0)
+            } else {
                 return container::Style::default();
-            }
+            };
             container::Style {
                 border: Border {
-                    color: theme.palette().primary.base.color,
-                    width: 2.0,
+                    color,
+                    width,
                     radius: 8.0.into(),
                 },
                 ..Default::default()
@@ -2763,6 +3137,11 @@ impl Graph {
             } else {
                 Space::new().width(12)
             },
+            icon_button(
+                crate::ui::icons::COPY,
+                "Copy the group's nodes",
+                Some(GraphMsg::CopyNodes(self.group_members(id)))
+            ),
             icon_button(
                 crate::ui::icons::NODE_GRAPH,
                 "Make a composite node of this group",
@@ -2960,23 +3339,72 @@ impl Graph {
     fn input_card(&self, node: &graph::Node, sections: Vec<NodeSection>) -> Element<'_, Message> {
         let id = node.id;
         let uses = self.dependents(id).len();
-        let extra = vec![
-            icon_button(
-                crate::ui::icons::TRI_UP,
-                "Move up",
-                self.can_move(id, -1).then_some(GraphMsg::Move(id, -1)),
-            ),
-            icon_button(
-                crate::ui::icons::TRI_DOWN,
-                "Move down",
-                self.can_move(id, 1).then_some(GraphMsg::Move(id, 1)),
-            ),
-        ];
+        let spec_name = match &node.kind {
+            Kind::Op(spec) => spec.name,
+            _ => "",
+        };
+        let slider = matches!(spec_name, "Number Slider" | "Integer Slider");
+        let range_open = self
+            .ui
+            .get(&id)
+            .is_some_and(|ui| ui.open.contains(RANGE_SECTION));
+        let mut extra = Vec::new();
+        if slider {
+            extra.push(icon_button(
+                crate::ui::icons::MORE,
+                if range_open {
+                    "Hide the range"
+                } else {
+                    "Edit the range: minimum, maximum and step"
+                },
+                Some(GraphMsg::Section(id, RANGE_SECTION.to_owned())),
+            ));
+        }
+        if slider || spec_name == "Number" {
+            extra.push(icon_button(
+                crate::ui::icons::SWAP,
+                if slider {
+                    "Turn into a typed number"
+                } else {
+                    "Turn into a slider"
+                },
+                Some(GraphMsg::ToggleSlider(id)),
+            ));
+        }
+        extra.push(icon_button(
+            crate::ui::icons::TRI_UP,
+            "Move up",
+            self.can_move(id, -1).then_some(GraphMsg::Move(id, -1)),
+        ));
+        extra.push(icon_button(
+            crate::ui::icons::TRI_DOWN,
+            "Move down",
+            self.can_move(id, 1).then_some(GraphMsg::Move(id, 1)),
+        ));
         let mut body = column![].spacing(4).padding([6, 8]);
+        let mut range = row![].spacing(4).align_y(iced::Center);
         for node_row in sections.into_iter().flat_map(|section| section.rows) {
-            if node_row.input {
-                body = body.push(self.input_row(id, node_row));
+            if !node_row.input {
+                continue;
             }
+            // A slider's range rows share one line, shown on request.
+            if slider && matches!(node_row.field.as_str(), "min" | "max" | "step") {
+                let port = Port {
+                    node: id,
+                    field: node_row.field.clone(),
+                };
+                range = range.push(
+                    text(t!(node_row.label.as_str()).into_owned())
+                        .size(10)
+                        .style(weak_text),
+                );
+                range = range.push(self.field_input(port, &node_row.value));
+                continue;
+            }
+            body = body.push(self.input_row(id, node_row));
+        }
+        if slider && range_open {
+            body = body.push(range);
         }
         body = body.push(
             row![
@@ -2988,6 +3416,11 @@ impl Graph {
                 .size(10)
                 .style(weak_text)
                 .width(Length::Fill),
+                icon_button(
+                    crate::ui::icons::COPY,
+                    "Copy node, to paste here or in another drawing",
+                    Some(GraphMsg::CopyNodes(vec![id])),
+                ),
                 self.group_picker(id),
             ]
             .spacing(4)
@@ -3032,17 +3465,7 @@ impl Graph {
                     .width(Length::Fill)
                     .into()
             }
-            RowWidget::Field => {
-                let draft = self.drafts.get(&port).cloned().unwrap_or(shown);
-                let edit = port.clone();
-                text_input("", &draft)
-                    .on_input(move |s| msg(GraphMsg::Input(edit.clone(), s)))
-                    .on_submit(msg(GraphMsg::Commit(port)))
-                    .size(11)
-                    .padding([3, 5])
-                    .width(Length::Fill)
-                    .into()
-            }
+            RowWidget::Field => self.field_input(port, &node_row.value),
             RowWidget::Table => return table_editor(port, &node_row.value),
         };
         row![
@@ -3054,6 +3477,23 @@ impl Graph {
         .spacing(4)
         .align_y(iced::Center)
         .into()
+    }
+
+    /// A typed value: its draft while edited, written on Enter.
+    fn field_input(&self, port: Port, value: &Value) -> Element<'_, Message> {
+        let draft = self
+            .drafts
+            .get(&port)
+            .cloned()
+            .unwrap_or_else(|| display(value));
+        let edit = port.clone();
+        text_input("", &draft)
+            .on_input(move |s| msg(GraphMsg::Input(edit.clone(), s)))
+            .on_submit(msg(GraphMsg::Commit(port)))
+            .size(11)
+            .padding([3, 5])
+            .width(Length::Fill)
+            .into()
     }
 
     /// A step of the node sequence: its settable rows, every one a picker button.
@@ -3110,6 +3550,9 @@ impl Graph {
             body = body.push(
                 container(text(t!("Object deleted")).size(11).style(weak_text)).padding([2, 2]),
             );
+        }
+        if self.compact {
+            return self.compact_card(node, step, body, sections, sources);
         }
         let mut computed: Vec<NodeRow> = Vec::new();
         for section in sections {
@@ -3192,10 +3635,18 @@ impl Graph {
             }
         }
         body = body.push(
-            row![Space::new().width(Length::Fill), self.group_picker(id)]
-                .spacing(4)
-                .padding([4, 2])
-                .align_y(iced::Center),
+            row![
+                icon_button(
+                    crate::ui::icons::COPY,
+                    "Copy node, to paste here or in another drawing",
+                    Some(GraphMsg::CopyNodes(vec![id])),
+                ),
+                Space::new().width(Length::Fill),
+                self.group_picker(id)
+            ]
+            .spacing(4)
+            .padding([4, 2])
+            .align_y(iced::Center),
         );
         self.hover_target(
             id,
@@ -3207,6 +3658,84 @@ impl Graph {
             .width(NODE_W)
             .into(),
         )
+    }
+
+    /// A step in the compact view: its header, issues, how many of its
+    /// inputs are linked and its first results.
+    fn compact_card<'a>(
+        &'a self,
+        node: &graph::Node,
+        step: usize,
+        mut body: iced::widget::Column<'a, Message>,
+        sections: Vec<NodeSection>,
+        sources: &HashMap<Port, (NodeId, String)>,
+    ) -> Element<'a, Message> {
+        let id = node.id;
+        let rows: Vec<NodeRow> = sections
+            .into_iter()
+            .flat_map(|section| section.rows)
+            .collect();
+        let inputs = rows.iter().filter(|row| row.input).count();
+        let linked = rows
+            .iter()
+            .filter(|row| {
+                row.input
+                    && sources.contains_key(&Port {
+                        node: id,
+                        field: row.field.clone(),
+                    })
+            })
+            .count();
+        if inputs > 0 {
+            body = body.push(
+                text(crate::tf!("{} of {} values linked", linked, inputs).into_owned())
+                    .size(10)
+                    .style(weak_text),
+            );
+        }
+        for node_row in rows
+            .into_iter()
+            .filter(|row| !row.input && row.field != "object")
+            .take(3)
+        {
+            body = body.push(
+                row![
+                    text(t!(node_row.label.as_str()).into_owned())
+                        .size(10)
+                        .width(70),
+                    with_list_preview(
+                        text(display(&node_row.value))
+                            .size(10)
+                            .style(weak_text)
+                            .width(Length::Fill)
+                            .into(),
+                        list_preview(&node_row.value),
+                    ),
+                ]
+                .spacing(4)
+                .align_y(iced::Center),
+            );
+        }
+        self.hover_target(
+            id,
+            Self::card(
+                id,
+                !node.issues.is_empty(),
+                column![self.header(node, Some(step), Vec::new()), body],
+            )
+            .width(COMPACT_W)
+            .into(),
+        )
+    }
+
+    /// The nodes of group `id`, in node order.
+    fn group_members(&self, id: GroupId) -> Vec<NodeId> {
+        self.engine
+            .nodes
+            .iter()
+            .filter(|node| self.node_group(node.id) == Some(id))
+            .map(|node| node.id)
+            .collect()
     }
 
     fn step_row(
@@ -4032,6 +4561,17 @@ impl Graph {
                 }
             }
             GraphMsg::Search(value) => self.search = value.clone(),
+            GraphMsg::NodeSearch(value) => {
+                self.node_search = value.clone();
+                self.found = None;
+                self.find(0);
+            }
+            GraphMsg::NodeSearchStep(step) => self.find(*step),
+            GraphMsg::ToggleCompact => self.compact = !self.compact,
+            GraphMsg::ToggleSlider(id) => {
+                self.record();
+                self.toggle_slider(*id);
+            }
             GraphMsg::Section(id, title) => {
                 if let Some(ui) = self.ui.get_mut(id) {
                     if !ui.open.remove(title) {
@@ -4301,6 +4841,9 @@ impl Graph {
         }
         if self.renaming.as_ref().map(|(target, _)| *target) == Some(Renaming::Node(id)) {
             self.renaming = None;
+        }
+        if self.found == Some(id) {
+            self.found = None;
         }
     }
 
@@ -4869,6 +5412,97 @@ mod tests {
         assert_ne!(graph.name(copy), graph.name(step));
         graph.update_ui(&GraphMsg::Undo);
         assert!(graph.engine.node(copy).is_none());
+    }
+
+    #[test]
+    fn copied_nodes_paste_with_their_links_groups_and_named_sources() {
+        let mut source = Graph::default();
+        let size = source.add_node(op("Number"), Vec::new());
+        let add = source.add_node(op("Add"), Vec::new());
+        let negate = source.add_node(op("Negate"), Vec::new());
+        link(&mut source, port(size, "value"), port(add, "a"));
+        link(&mut source, port(add, "result"), port(negate, "x"));
+        source.update_ui(&GraphMsg::GroupNew(add));
+        source.update_ui(&GraphMsg::GroupAssign(negate, source.node_group(add)));
+        let text = source.copy_text(&[add, negate]);
+
+        // Another graph with an input of the same name as the outer source.
+        let mut target = Graph::default();
+        let other = target.add_node(op("Number"), Vec::new());
+        assert_eq!(target.name(other), source.name(size));
+        let added = target.paste_text(&text).unwrap();
+        assert_eq!(added.len(), 2);
+        let (copy_add, copy_negate) = (added[0], added[1]);
+        assert!(
+            target.engine.is_linked(&port(copy_negate, "x")),
+            "inner link kept"
+        );
+        assert_eq!(
+            target
+                .engine
+                .links
+                .iter()
+                .find(|l| l.to == port(copy_add, "a"))
+                .map(|l| l.from.node),
+            Some(other),
+            "outer link found by name"
+        );
+        let group = target.node_group(copy_add);
+        assert!(group.is_some() && group == target.node_group(copy_negate));
+
+        // Pasting again beside the originals renames the copies.
+        let again = source.paste_text(&text).unwrap();
+        assert_ne!(source.name(again[0]), source.name(add));
+        assert!(source.paste_text("not nodes").is_err());
+        source.update_ui(&GraphMsg::Undo);
+        assert!(source.engine.node(again[0]).is_none());
+    }
+
+    #[test]
+    fn numbers_turn_into_sliders_and_back_keeping_links() {
+        let mut graph = Graph::default();
+        let size = graph.add_node(op("Number"), Vec::new());
+        let step = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(size, "value"), port(step, "x"));
+        graph
+            .engine
+            .node_mut(size)
+            .unwrap()
+            .params
+            .insert("value".into(), json!(4.0));
+        graph.update_ui(&GraphMsg::ToggleSlider(size));
+        let node = graph.engine.node(size).unwrap();
+        assert!(matches!(&node.kind, Kind::Op(spec) if spec.name == "Number Slider"));
+        assert_eq!(node.params["value"], json!(4.0));
+        assert_eq!(node.params["max"], json!(8.0));
+        assert!(graph.engine.is_linked(&port(step, "x")));
+        graph.update_ui(&GraphMsg::ToggleSlider(size));
+        let node = graph.engine.node(size).unwrap();
+        assert!(matches!(&node.kind, Kind::Op(spec) if spec.name == "Number"));
+        assert!(!node.params.contains_key("max"));
+    }
+
+    #[test]
+    fn the_find_box_steps_through_matches_and_opens_their_group() {
+        let mut graph = Graph::default();
+        let wall = graph.add_node(op("Add"), Vec::new());
+        let _other = graph.add_node(op("Negate"), Vec::new());
+        let wall_two = graph.add_node(op("Add"), Vec::new());
+        graph.update_ui(&GraphMsg::GroupNew(wall_two));
+        let group = graph.node_group(wall_two).unwrap();
+        graph.update_ui(&GraphMsg::GroupCollapse(group));
+        graph.update_ui(&GraphMsg::NodeSearch("add".into()));
+        assert_eq!(graph.search_matches(), vec![wall, wall_two]);
+        assert_eq!(graph.found, Some(wall));
+        assert_eq!(graph.found_place(), Some((false, 0.0)));
+        graph.update_ui(&GraphMsg::NodeSearchStep(1));
+        assert_eq!(graph.found, Some(wall_two));
+        assert_eq!(graph.found_place(), Some((false, 1.0)));
+        assert!(!graph.group(group).unwrap().collapsed, "its group opens");
+        graph.update_ui(&GraphMsg::NodeSearchStep(1));
+        assert_eq!(graph.found, Some(wall), "wraps round");
+        graph.update_ui(&GraphMsg::NodeSearch("nothing".into()));
+        assert_eq!(graph.found, None);
     }
 
     #[test]

@@ -456,6 +456,8 @@ impl OpenCADStudio {
             }
         }
         let mut task = self.update_message(msg);
+        // Drawn objects a graph reads from a layer feed it again once edited.
+        task = Task::batch([task, self.graph_follow_drawing()]);
         // What a message changed is only known while it is handled, also when
         // it returned early.
         self.block_palette.change_hint = Default::default();

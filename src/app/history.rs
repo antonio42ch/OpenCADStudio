@@ -1293,6 +1293,7 @@ impl OpenCADStudio {
         changes: &[(Handle, crate::scene::ChangeKind)],
     ) {
         self.tabs[i].edit_revision = self.tabs[i].edit_revision.wrapping_add(1);
+        self.graph_follow_absorb(i);
         {
             let scene = &mut self.tabs[i].scene;
             if had_full {

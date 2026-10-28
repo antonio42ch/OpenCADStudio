@@ -1604,6 +1604,99 @@ mod tests {
         assert_eq!(state["inputs"], json!([]));
     }
 
+    /// The value of output `port` of step `name`.
+    fn port_value(state: &Value, name: &str, port: &str) -> Value {
+        node(state, "sequence", name)["ports"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["name"] == port)
+            .unwrap_or_else(|| panic!("{name}.{port}: {state}"))["value"]
+            .clone()
+    }
+
+    /// A graph that reads the lines on a layer, computes from them and
+    /// draws on a layer and linetype of its own, then follows a line drawn
+    /// later.
+    #[test]
+    fn layer_objects_follow_the_drawing_into_styled_output() {
+        let mut app = app();
+        let i = app.active_tab;
+        app.tabs[i].scene.ensure_layer("Axes");
+        app.tabs[i].active_layer = "Axes".to_owned();
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,2 3,2"}"#);
+        app.tabs[i].active_layer = "0".to_owned();
+        let built = apply_changes(
+            &mut app,
+            "w1",
+            json!([
+                {"add": "Text", "source": "builtin", "name": "Axis layer", "values": {"value": "Axes"}},
+                {"add": "Text", "source": "builtin", "name": "Kind", "values": {"value": "Line"}},
+                {"add": "Text", "source": "builtin", "name": "Formula", "values": {"value": "a * 2 + (a > 1)"}},
+                {"add": "Text", "source": "builtin", "name": "Long only", "values": {"value": "x > 5"}},
+                {"add": "Text", "source": "builtin", "name": "Template", "values": {"value": "L-{a:00}"}},
+                {"add": "Text", "source": "builtin", "name": "Result layer", "values": {"value": "Results"}},
+                {"add": "Text", "source": "builtin", "name": "Dashes", "values": {"value": "DASHED"}},
+                {"add": "Number", "name": "Weight", "values": {"value": 0.5}},
+                {"add": "Layer Objects", "name": "Axes in"},
+                {"link": "Axis layer.value", "to": "Axes in.layer"},
+                {"link": "Kind.value", "to": "Axes in.type"},
+                {"add": "Expression", "name": "Twice"},
+                {"link": "Formula.value", "to": "Twice.expression"},
+                {"link": "Axes in.count", "to": "Twice.a"},
+                {"add": "Filter", "name": "Long"},
+                {"link": "Long only.value", "to": "Long.condition"},
+                {"link": "Axes in.curves", "to": "Long.list"},
+                {"add": "Format Text", "name": "Label"},
+                {"link": "Template.value", "to": "Label.template"},
+                {"link": "Twice.result", "to": "Label.a"},
+                {"add": "Draw Geometry", "name": "Out"},
+                {"link": "Long.in", "to": "Out.geometry"},
+                {"link": "Result layer.value", "to": "Out.layer"},
+                {"link": "Dashes.value", "to": "Out.linetype"},
+                {"link": "Weight.value", "to": "Out.lineweight"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Axes in", "count"), json!(2.0));
+        assert_eq!(port_value(&state, "Twice", "result"), json!(5.0));
+        assert_eq!(port_value(&state, "Label", "result"), json!("L-05"));
+        assert_eq!(
+            node(&state, "sequence", "Out")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let document = &app.tabs[i].scene.document;
+        assert!(document.layers.contains("Results"), "the layer is made");
+        let drawn = app.tabs[i].graph.owned_handles();
+        let line = document.get_entity(drawn[0]).unwrap().common();
+        assert_eq!(
+            (line.layer.as_str(), line.linetype.as_str()),
+            ("Results", "DASHED")
+        );
+        assert_eq!(line.line_weight, codec::types::LineWeight::Value(50));
+
+        // The graph's own line is on another layer; a new axis feeds it.
+        app.tabs[i].active_layer = "Axes".to_owned();
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,5 20,5"}"#);
+        let _ = app.graph_follow_drawing();
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Axes in", "count"), json!(3.0));
+        assert_eq!(
+            node(&state, "sequence", "Out")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(2)
+        );
+        // Nothing new: no run.
+        let revision = app.tabs[i].graph.revision;
+        let _ = app.graph_follow_drawing();
+        assert_eq!(app.tabs[i].graph.revision, revision);
+    }
+
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {
         let query = app.automation_op(&format!(
             r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#
