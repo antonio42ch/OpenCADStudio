@@ -406,7 +406,12 @@ impl OpenCADStudio {
                             *entity.common_mut() = existing.common().clone();
                         }
                         style(&mut entity);
-                        self.tabs[i].scene.update_entity(entity);
+                        // Unchanged entities stay as they are: no redraw, no
+                        // undo record.
+                        if self.tabs[i].scene.document.get_entity(handle) != Some(&entity) {
+                            self.tabs[i].scene.update_entity(entity);
+                            self.tabs[i].dirty = true;
+                        }
                         handle
                     }
                     None => {
@@ -415,10 +420,10 @@ impl OpenCADStudio {
                         let Some(handle) = self.commit_entity_handle_preserve_style(entity) else {
                             continue;
                         };
+                        self.tabs[i].dirty = true;
                         handle
                     }
                 };
-                self.tabs[i].dirty = true;
                 drawn.push(handle);
                 objects.push(json!({ "handle": handle.value() }));
             }

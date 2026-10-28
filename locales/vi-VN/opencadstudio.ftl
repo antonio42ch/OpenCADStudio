@@ -7364,3 +7364,8 @@ node-help =
     .object-tag-objects-help = Writes data onto drawn objects, such as kind=door; segment=A, without owning them, so Object Data and Layer Objects can sort them later.
     .curve-label = Curve
     .formula-issue = The formula does not read: __ocs_fmt_0__
+    .op-slopes = The slope between each point and the next, as a percentage, a ratio (rise over run) and an angle in degrees, and the horizontal run: the grades of a profile or the falls of a pipe.
+    .op-to-profile = Places a profile point (x the station, y the elevation) on a profile drawing: its origin at the start station and the datum elevation, elevations stretched by the exaggeration, as Profile Grid draws them.
+    .op-vertical-alignment = A profile grade line through points of intersection (x the station, y the elevation) with a parabolic vertical curve of the given length at each: points along it every step and at every PVI, PVC and PVT, the grade of each tangent in percent, where each curve starts and ends, and each curve's K (its length per percent of grade change).
+    .op-elevation-at = The elevation and grade (percent) of a grade line with vertical curves at a station, as Vertical Alignment builds it, and the profile point there.
+    .op-profile-grid = The lines of a profile grid from a start to an end station and from a datum to a top elevation, at an origin, with elevations stretched by the exaggeration: the lines, the stations and the points under them for labels, the elevations and the points beside them.

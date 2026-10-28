@@ -7357,3 +7357,8 @@ node-help =
     .object-tag-objects-help = Escribe datos en objetos dibujados, como tipo=puerta; tramo=A, sin adueñarse de ellos, para que Object Data y Layer Objects puedan clasificarlos después.
     .curve-label = Curva
     .formula-issue = La fórmula no se puede leer: __ocs_fmt_0__
+    .op-slopes = La pendiente entre cada punto y el siguiente, en porcentaje, como razón (subida sobre recorrido) y como ángulo en grados, y el recorrido horizontal: las pendientes de un perfil o la caída de una tubería.
+    .op-to-profile = Coloca un punto de perfil (x la progresiva, y la cota) en un dibujo de perfil: su origen en la progresiva inicial y la cota de referencia, con las cotas estiradas por la exageración, tal como las dibuja Profile Grid.
+    .op-vertical-alignment = Una rasante por puntos de intersección (x la progresiva, y la cota) con una curva vertical parabólica de la longitud dada en cada uno: puntos a lo largo de ella cada paso y en cada PIV, PCV y PTV, la pendiente de cada tangente en porcentaje, dónde empieza y termina cada curva, y el K de cada curva (su longitud por cada porcentaje de cambio de pendiente).
+    .op-elevation-at = La cota y la pendiente (en porcentaje) de una rasante con curvas verticales en una progresiva, tal como la arma Vertical Alignment, y el punto del perfil allí.
+    .op-profile-grid = Las líneas de una cuadrícula de perfil desde una progresiva inicial hasta una final y desde una cota de referencia hasta una superior, en un origen, con las cotas estiradas por la exageración: las líneas, las progresivas y los puntos bajo ellas para rotularlas, las cotas y los puntos a su lado.

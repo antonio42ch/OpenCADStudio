@@ -79,6 +79,10 @@ Every drawing node takes `data`, text such as `kind=door; segment=A` it stores o
 
 For profiles, **Distance Along Curve** gives a point's station along an alignment, its signed `offset` (left positive), the foot point and the curve's angle there, and **Interpolate Values** reads a `y` at an `x` from two parallel lists, such as an elevation at a station from a profile's stations and elevations.
 
+A profile is drawn in profile space, where x is the station and y the elevation: **Vertical Alignment** takes PVIs as points `(station, elevation)` and a vertical curve `length` at each, and gives `points` along the grade line every `step` (and at every PVI, PVC and PVT), each tangent's grade in percent, the curves' PVC and PVT points and their K; **Elevation At** gives the elevation and grade at any station; **Slopes** gives the grades between consecutive points. **Profile Grid** gives the grid lines and label points from a `start` to an `end` station and a `datum` to a `top` elevation, elevations stretched by `exaggeration`, and **To Profile** places profile points on that same grid, so `Vertical Alignment.points` → To Profile → Polyline Curve → Draw Geometry draws the grade line over it.
+
+The graph only reruns what changed: an operation or composite whose inputs are the same as in the last run, and that reads neither drawn objects nor files, keeps its results, and a drawing node whose entities come out the same leaves them untouched.
+
 A formula or condition that does not read shows why in the node's issues, such as "The formula does not read: unknown name `q`".
 
 Nested lists are the graph's trees: Graft, Flatten Once, List Depth, Cross Reference, Weave, Shift List and Cull Pattern reshape them, and a list reaching a step's single-value input runs the step once per element, recursively.

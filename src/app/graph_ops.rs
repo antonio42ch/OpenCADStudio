@@ -1798,6 +1798,95 @@ mod tests {
         let _ = std::fs::remove_file(&csv);
     }
 
+    /// A profile drawing from a table of PVIs: its grid, the grade line
+    /// with its vertical curves, and the grades as labels. Running it again
+    /// unchanged leaves the drawing as it is.
+    #[test]
+    fn a_profile_draws_its_grid_and_grade_line_once() {
+        let mut app = app();
+        let i = app.active_tab;
+        let built = apply_changes(
+            &mut app,
+            "p1",
+            json!([
+                {"add": "Table", "name": "PVIs", "values": {"table": [
+                    ["station", "elevation", "curve"], [0, 100, 0], [120, 103, 80], [240, 101, 0]]}},
+                {"add": "Number", "name": "Exaggeration", "values": {"value": 10}},
+                {"add": "Number", "name": "Datum", "values": {"value": 98}},
+                {"add": "Number", "name": "Top", "values": {"value": 106}},
+                {"add": "Number", "name": "Last", "values": {"value": 240}},
+                {"add": "Text", "source": "builtin", "name": "Grade text", "values": {"value": "{a:.2} %"}},
+                {"add": "Point", "source": "builtin", "name": "PVI"},
+                {"link": "PVIs.column 1", "to": "PVI.x"},
+                {"link": "PVIs.column 2", "to": "PVI.y"},
+                {"add": "Vertical Alignment", "name": "Grade line"},
+                {"link": "PVI.point", "to": "Grade line.pvis"},
+                {"link": "PVIs.column 3", "to": "Grade line.lengths"},
+                {"add": "To Profile", "name": "On sheet"},
+                {"link": "Grade line.points", "to": "On sheet.point"},
+                {"link": "Datum.value", "to": "On sheet.datum"},
+                {"link": "Exaggeration.value", "to": "On sheet.exaggeration"},
+                {"add": "Polyline Curve", "name": "Profile"},
+                {"link": "On sheet.point", "to": "Profile.points"},
+                {"add": "Draw Geometry", "name": "Draw profile"},
+                {"link": "Profile.curve", "to": "Draw profile.geometry"},
+                {"add": "Profile Grid", "name": "Grid"},
+                {"link": "Last.value", "to": "Grid.end"},
+                {"link": "Datum.value", "to": "Grid.datum"},
+                {"link": "Top.value", "to": "Grid.top"},
+                {"link": "Exaggeration.value", "to": "Grid.exaggeration"},
+                {"add": "Draw Geometry", "name": "Draw grid"},
+                {"link": "Grid.lines", "to": "Draw grid.geometry"},
+                {"add": "Format Text", "name": "Grades"},
+                {"link": "Grade text.value", "to": "Grades.template"},
+                {"link": "Grade line.grades", "to": "Grades.a"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            port_value(&state, "Grade line", "grades"),
+            json!([2.5, -1.6666666666666667])
+        );
+        assert_eq!(
+            port_value(&state, "Grades", "result"),
+            json!(["2.50 %", "-1.67 %"])
+        );
+        assert_eq!(
+            port_value(&state, "Grade line", "k")
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+        let grid = node(&state, "sequence", "Draw grid")["entities"]
+            .as_array()
+            .map(Vec::len);
+        assert_eq!(grid, Some(13 + 9), "13 station and 9 elevation lines");
+        assert_eq!(
+            node(&state, "sequence", "Draw profile")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+
+        let before: Vec<String> = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .map(|entity| format!("{entity:?}"))
+            .collect();
+        let epoch = app.tabs[i].scene.geometry_epoch;
+        let _ = app.graph_run(i);
+        let after: Vec<String> = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .map(|entity| format!("{entity:?}"))
+            .collect();
+        assert_eq!(before, after);
+        assert_eq!(app.tabs[i].scene.geometry_epoch, epoch, "nothing redrawn");
+    }
+
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {
         let query = app.automation_op(&format!(
             r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#
