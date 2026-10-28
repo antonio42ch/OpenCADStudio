@@ -99,6 +99,12 @@ pub enum ObjectKind {
     Block,
     /// Places aligned dimensions between two points.
     Dimension,
+    /// Draws a table of rows as lines and texts.
+    Table,
+    /// Writes a text along a curve, following its direction.
+    Label,
+    /// Writes data onto drawn objects it does not own.
+    Tag,
 }
 
 pub const OBJECTS: &[ObjectKind] = &[
@@ -116,6 +122,9 @@ pub const OBJECTS: &[ObjectKind] = &[
     ObjectKind::Hatch,
     ObjectKind::Block,
     ObjectKind::Dimension,
+    ObjectKind::Table,
+    ObjectKind::Label,
+    ObjectKind::Tag,
 ];
 
 impl ObjectKind {
@@ -139,6 +148,9 @@ impl ObjectKind {
             ObjectKind::Hatch => "Hatch",
             ObjectKind::Block => "Insert Block",
             ObjectKind::Dimension => "Aligned Dimension",
+            ObjectKind::Table => "Draw Table",
+            ObjectKind::Label => "Curve Label",
+            ObjectKind::Tag => "Tag Objects",
         }
     }
 
@@ -159,6 +171,9 @@ impl ObjectKind {
             ObjectKind::Hatch => "Fills closed curves with a hatch: one hatch per region, a list holding an outline and its holes. SOLID fills; any other name is a hatch pattern, at a scale and an angle in degrees.",
             ObjectKind::Block => "Places a block of the drawing at each point, turned by an angle in degrees and scaled: doors, windows, trees or posts along an axis. A block the drawing lacks places nothing.",
             ObjectKind::Dimension => "Places an aligned dimension between two points, its line an offset to their left; the text, when given, replaces the measurement.",
+            ObjectKind::Table => "Draws rows of cells as a table of lines and texts at a point: a schedule of areas, stations or openings. Columns fit their texts unless a width is given.",
+            ObjectKind::Label => "Writes a text on each curve, at a distance along it (the middle when unset) and an offset to its left, turned to follow the curve and kept readable.",
+            ObjectKind::Tag => "Writes data onto drawn objects, such as kind=door; segment=A, without owning them, so Object Data and Layer Objects can sort them later.",
         }
     }
 
@@ -179,7 +194,13 @@ impl ObjectKind {
     pub fn places(self) -> bool {
         matches!(
             self,
-            ObjectKind::Draw | ObjectKind::Hatch | ObjectKind::Block | ObjectKind::Dimension
+            ObjectKind::Draw
+                | ObjectKind::Hatch
+                | ObjectKind::Block
+                | ObjectKind::Dimension
+                | ObjectKind::Table
+                | ObjectKind::Label
+                | ObjectKind::Tag
         )
     }
 
@@ -209,6 +230,8 @@ impl ObjectKind {
                 | (ObjectKind::Hatch, EntityType::Hatch(_))
                 | (ObjectKind::Block, EntityType::Insert(_))
                 | (ObjectKind::Dimension, EntityType::Dimension(_))
+                | (ObjectKind::Table, EntityType::Line(_) | EntityType::Text(_))
+                | (ObjectKind::Label, EntityType::Text(_))
         )
     }
 
@@ -228,6 +251,7 @@ impl ObjectKind {
             ObjectKind::Hatch => "HATCH",
             ObjectKind::Block => "INSERT",
             ObjectKind::Dimension => "DIMALIGNED",
+            ObjectKind::Table | ObjectKind::Label | ObjectKind::Tag => "",
         }
     }
 
@@ -270,7 +294,13 @@ impl ObjectKind {
                 e::MText::with_value("MText", origin).with_height(2.5),
             )),
             // These nodes' entities come from their inputs.
-            ObjectKind::Draw | ObjectKind::Hatch | ObjectKind::Block | ObjectKind::Dimension => {
+            ObjectKind::Draw
+            | ObjectKind::Hatch
+            | ObjectKind::Block
+            | ObjectKind::Dimension
+            | ObjectKind::Table
+            | ObjectKind::Label
+            | ObjectKind::Tag => {
                 EntityType::Line(e::Line::from_coords(0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
             }
         }
@@ -693,6 +723,7 @@ pub(crate) fn issue_text(issue: &graph::Issue) -> String {
         graph::Issue::EmptyList(input) => crate::tf!("The list on {} is empty", input).into_owned(),
         graph::Issue::NoResult => t!("No result with these values").into_owned(),
         graph::Issue::Inner(step, issue) => format!("{}: {}", t!(step.as_str()), issue_text(issue)),
+        graph::Issue::Formula(why) => crate::tf!("The formula does not read: {}", why).into_owned(),
     }
 }
 

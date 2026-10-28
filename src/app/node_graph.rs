@@ -374,12 +374,22 @@ impl OpenCADStudio {
                     }),
                 _ => codec::types::Color::ByLayer,
             };
+            let data = get("data")
+                .map(|value| data_pairs(&graph::value::text(&value)))
+                .unwrap_or_default();
+            if !data.is_empty() {
+                self.tabs[i].scene.ensure_app_id(DATA_APP);
+            }
             let style = |entity: &mut codec::EntityType| {
                 let common = entity.common_mut();
                 common.layer = layer.clone();
                 common.color = color;
                 common.linetype = linetype.clone().unwrap_or_default();
                 common.line_weight = line_weight;
+                common.extended_data.remove_record(DATA_APP);
+                if !data.is_empty() {
+                    write_data(entity, &data);
+                }
             };
             let mut objects = Vec::new();
             for mut entity in entities {
@@ -425,7 +435,7 @@ impl OpenCADStudio {
                 .filter(|(field, _)| {
                     !matches!(
                         field.as_str(),
-                        "layer" | "color" | "linetype" | "lineweight" | "object"
+                        "layer" | "color" | "linetype" | "lineweight" | "data" | "object"
                     )
                 })
                 .cloned()
@@ -450,6 +460,14 @@ impl OpenCADStudio {
                         _ => json!("ByLayer"),
                     },
                 ),
+                (
+                    "data".to_owned(),
+                    json!(data
+                        .iter()
+                        .map(|(key, value)| format!("{key}={value}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")),
+                ),
                 ("object".to_owned(), object),
             ]);
             results.push(result);
@@ -464,7 +482,7 @@ impl OpenCADStudio {
         results
     }
 
-    fn graph_run(&mut self, i: usize) -> Task<Message> {
+    pub(super) fn graph_run(&mut self, i: usize) -> Task<Message> {
         self.graph_step(i, |_| Vec::new())
     }
 
@@ -489,6 +507,77 @@ impl OpenCADStudio {
         let task = self.graph_run(i);
         self.tabs[i].graph.watched = watched_fingerprint(&self.tabs[i]);
         task
+    }
+
+    /// Writes each instance's data onto the objects it names, which the
+    /// node does not own.
+    fn graph_tag(
+        &mut self,
+        i: usize,
+        instances: &[Vec<(String, Value)>],
+    ) -> Vec<Vec<(String, Value)>> {
+        let mut results = Vec::new();
+        for fields in instances {
+            let get = |name: &str| {
+                fields
+                    .iter()
+                    .find(|(field, _)| field == name)
+                    .map(|(_, value)| value.clone())
+                    .unwrap_or(Value::Null)
+            };
+            let pairs = data_pairs(&graph::value::text(&get("data")));
+            let objects = get("objects");
+            let handles: Vec<Handle> = match &objects {
+                Value::Array(items) => items.iter().collect::<Vec<_>>(),
+                other => vec![other],
+            }
+            .into_iter()
+            .filter_map(|object| object.get("handle")?.as_u64())
+            .map(Handle::new)
+            .collect();
+            if !pairs.is_empty() {
+                self.tabs[i].scene.ensure_app_id(DATA_APP);
+            }
+            for handle in handles {
+                if self.tabs[i].scene.is_layer_locked(handle) {
+                    continue;
+                }
+                let Some(mut entity) = self.tabs[i].scene.document.get_entity(handle).cloned()
+                else {
+                    continue;
+                };
+                let before = entity_data(&entity);
+                write_data(&mut entity, &pairs);
+                if entity_data(&entity) != before {
+                    self.tabs[i].scene.update_entity(entity);
+                    self.tabs[i].dirty = true;
+                }
+            }
+            results.push(vec![
+                ("objects".to_owned(), objects),
+                ("data".to_owned(), get("data")),
+            ]);
+        }
+        results
+    }
+
+    /// `path` as a file path: relative paths are taken from the drawing's
+    /// folder, or the working folder for an unsaved drawing.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn graph_file_path(&self, i: usize, path: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::Path::new(path.trim());
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        if path.is_absolute() {
+            return Some(path.to_path_buf());
+        }
+        let folder = self.tabs[i]
+            .current_path
+            .as_ref()
+            .and_then(|file| file.parent().map(std::path::Path::to_path_buf))
+            .unwrap_or_default();
+        Some(folder.join(path))
     }
 
     /// Takes the drawing as the graph's Layer Objects nodes now see it,
@@ -962,8 +1051,22 @@ impl graph::Host for AppHost<'_> {
         let Some(kind) = ObjectKind::from_name(kind) else {
             return Vec::new();
         };
-        if kind.places() {
-            return app.graph_draw(i, node, kind, instances);
+        match kind {
+            ObjectKind::Tag => return app.graph_tag(i, instances),
+            // One table from all the rows, which arrive one per instance.
+            ObjectKind::Table => {
+                let mut table = instances[0].clone();
+                table.retain(|(field, _)| field != "rows");
+                let rows = instances
+                    .iter()
+                    .filter_map(|fields| fields.iter().find(|(field, _)| field == "rows"))
+                    .map(|(_, row)| row.clone())
+                    .collect();
+                table.push(("rows".to_owned(), Value::Array(rows)));
+                return app.graph_draw(i, node, kind, &[table]);
+            }
+            _ if kind.places() => return app.graph_draw(i, node, kind, instances),
+            _ => {}
         }
         let mut handles: Vec<Handle> = app.tabs[i]
             .graph
@@ -1026,6 +1129,75 @@ impl graph::Host for AppHost<'_> {
 
     fn expression(&self, text: &str) -> Option<f64> {
         crate::app::expr_eval::eval_number(text)
+    }
+
+    fn object_data(&self, object: &Value, key: &str) -> Value {
+        let Some(entity) = object
+            .get("handle")
+            .and_then(Value::as_u64)
+            .and_then(|handle| {
+                self.app.tabs[self.i]
+                    .scene
+                    .document
+                    .get_entity(Handle::new(handle))
+            })
+        else {
+            return Value::Null;
+        };
+        let data = entity_data(entity);
+        if key.is_empty() {
+            return Value::Array(
+                data.iter()
+                    .map(|(key, value)| json!(format!("{key}={value}")))
+                    .collect(),
+            );
+        }
+        data.into_iter()
+            .find(|(seen, _)| seen.eq_ignore_ascii_case(key))
+            .map_or(Value::Null, |(_, value)| match value.parse::<f64>() {
+                Ok(x) => graph::value::number(x),
+                Err(_) => Value::String(value),
+            })
+    }
+
+    fn read_file(&self, path: &str) -> Option<String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let path = self.app.graph_file_path(self.i, path)?;
+            let bytes = std::fs::read(path).ok()?;
+            Some(String::from_utf8_lossy(&bytes).into_owned())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = path;
+            None
+        }
+    }
+
+    fn write_file(&self, path: &str, text: &str) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(path) = self.app.graph_file_path(self.i, path) else {
+                return false;
+            };
+            // Only data files, so a graph never overwrites a drawing.
+            let data_file = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("csv") || ext.eq_ignore_ascii_case("txt")
+                });
+            if !data_file {
+                return false;
+            }
+            std::fs::read(&path).is_ok_and(|old| old == text.as_bytes())
+                || std::fs::write(&path, text).is_ok()
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = (path, text);
+            false
+        }
     }
 
     fn layer_objects(&self, layer: &str, kind: &str) -> Vec<Value> {
@@ -1110,7 +1282,9 @@ fn is_placing(kind: &Kind) -> bool {
 
 /// A placing node's rows: field, label, whether it is an input, and the
 /// kind of value it takes. Every one ends with the layer, colour, linetype
-/// and lineweight (in millimetres) it draws with, and the entities it drew.
+/// and lineweight (in millimetres) it draws with, the data it writes on its
+/// entities, and the entities it drew. Tag Objects draws nothing: it takes
+/// the objects to write its data on.
 fn place_fields(kind: ObjectKind) -> Vec<(&'static str, &'static str, bool, Type, bool)> {
     let mut fields = vec![("object", "Object", false, Type::Object, false)];
     fields.extend_from_slice(match kind {
@@ -1132,12 +1306,32 @@ fn place_fields(kind: ObjectKind) -> Vec<(&'static str, &'static str, bool, Type
             ("offset", "Offset", true, Type::Number, false),
             ("text", "Text", true, Type::Text, false),
         ][..],
+        ObjectKind::Table => &[
+            ("rows", "Rows", true, Type::Any, true),
+            ("point", "Point", true, Type::Point, false),
+            ("height", "Text height", true, Type::Number, false),
+            ("width", "Column width", true, Type::Number, false),
+        ][..],
+        ObjectKind::Label => &[
+            ("curve", "Curve", true, Type::Curve, false),
+            ("text", "Text", true, Type::Text, false),
+            ("distance", "Distance", true, Type::Number, false),
+            ("offset", "Offset", true, Type::Number, false),
+            ("height", "Text height", true, Type::Number, false),
+        ][..],
+        ObjectKind::Tag => {
+            return vec![
+                ("objects", "Objects", true, Type::Object, true),
+                ("data", "Data", true, Type::Text, false),
+            ];
+        }
         _ => &[("geometry", "Geometry", true, Type::Curve, true)][..],
     });
     fields.push(("layer", "Layer", true, Type::Text, false));
     fields.push(("color", "Color", true, Type::Number, false));
     fields.push(("linetype", "Linetype", true, Type::Text, false));
     fields.push(("lineweight", "Lineweight", true, Type::Number, false));
+    fields.push(("data", "Data", true, Type::Text, false));
     fields
 }
 
@@ -1225,6 +1419,50 @@ fn place_entities(
                 ),
             ]
         }
+        ObjectKind::Table => table_entities(
+            &graph::value::list(&get("rows").unwrap_or(Value::Null)),
+            point("point").unwrap_or_default(),
+            number("height", 2.5).abs().max(1e-6),
+            number("width", 0.0).max(0.0),
+        ),
+        ObjectKind::Label => {
+            let (Some(curve), Some(label)) = (
+                get("curve").as_ref().and_then(graph::value::curve),
+                get("text").map(|value| graph::value::text(&value)),
+            ) else {
+                return Vec::new();
+            };
+            let length = curve.length();
+            let distance = get("distance")
+                .as_ref()
+                .and_then(graph::value::num)
+                .unwrap_or(length * 0.5);
+            let Some(frame) =
+                graph::geometry::curve_frame(&curve, curve.parameter_at_distance(distance))
+            else {
+                return Vec::new();
+            };
+            let offset = number("offset", 0.0);
+            let at =
+                graph::geometry::add(frame.origin, graph::geometry::scale(frame.y_axis, offset));
+            // Kept readable: a text running leftwards turns round.
+            let mut angle = frame.x_axis[1].atan2(frame.x_axis[0]);
+            if angle.cos() < -1e-9 {
+                angle += std::f64::consts::PI;
+            }
+            let at = Vector3::new(at[0], at[1], at[2]);
+            let mut text = e::Text::with_value(label, at)
+                .with_height(number("height", 2.5).abs().max(1e-6))
+                .with_rotation(angle);
+            text.horizontal_alignment = e::TextHorizontalAlignment::Center;
+            text.vertical_alignment = if offset < 0.0 {
+                e::TextVerticalAlignment::Top
+            } else {
+                e::TextVerticalAlignment::Bottom
+            };
+            text.alignment_point = Some(at);
+            vec![codec::EntityType::Text(text)]
+        }
         _ => {
             let mut curves = Vec::new();
             collect_curves(&get("geometry").unwrap_or(Value::Null), &mut curves);
@@ -1234,6 +1472,128 @@ fn place_entities(
                 .collect()
         }
     }
+}
+
+/// A table of `rows` with its top left corner at `corner`: a line on every
+/// cell edge and each cell's text, `height` high. Columns are `width` wide,
+/// or as wide as their longest text when it is zero.
+fn table_entities(
+    rows: &[Value],
+    corner: [f64; 3],
+    height: f64,
+    width: f64,
+) -> Vec<codec::EntityType> {
+    use codec::entities as e;
+    use codec::types::Vector3;
+    let cells: Vec<Vec<String>> = rows
+        .iter()
+        .map(|row| match row {
+            Value::Array(cells) => cells.iter().map(crate::ui::node_graph::display).collect(),
+            other => vec![crate::ui::node_graph::display(other)],
+        })
+        .collect();
+    let columns = cells.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+    let pad = height * 0.5;
+    let widths: Vec<f64> = (0..columns)
+        .map(|k| {
+            if width > 0.0 {
+                return width;
+            }
+            let chars = cells
+                .iter()
+                .filter_map(|row| row.get(k))
+                .map(|cell| cell.chars().count())
+                .max()
+                .unwrap_or(0);
+            (chars as f64 * height * 0.8 + 2.0 * pad).max(height * 2.0)
+        })
+        .collect();
+    let row_height = height + 2.0 * pad;
+    let [x0, y0, z] = corner;
+    let total_w: f64 = widths.iter().sum();
+    let total_h = row_height * cells.len() as f64;
+    let line = |a: (f64, f64), b: (f64, f64)| {
+        codec::EntityType::Line(e::Line::from_coords(a.0, a.1, z, b.0, b.1, z))
+    };
+    let mut entities = Vec::new();
+    for k in 0..=cells.len() {
+        let y = y0 - row_height * k as f64;
+        entities.push(line((x0, y), (x0 + total_w, y)));
+    }
+    let mut x = x0;
+    for k in 0..=columns {
+        entities.push(line((x, y0), (x, y0 - total_h)));
+        x += widths.get(k).copied().unwrap_or(0.0);
+    }
+    for (r, row) in cells.iter().enumerate() {
+        let mut x = x0;
+        for (k, cell) in row.iter().enumerate() {
+            if !cell.is_empty() {
+                let at = Vector3::new(x + pad, y0 - row_height * (r + 1) as f64 + pad, z);
+                entities.push(codec::EntityType::Text(
+                    e::Text::with_value(cell.clone(), at).with_height(height),
+                ));
+            }
+            x += widths[k];
+        }
+    }
+    entities
+}
+
+/// The XDATA application drawn objects keep the graph's data under.
+const DATA_APP: &str = "OCS_DATA";
+
+/// `key=value` pairs from text such as `kind=door; segment=A`, one pair per
+/// `;` or line.
+fn data_pairs(text: &str) -> Vec<(String, String)> {
+    text.split([';', '\n'])
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=')?;
+            let key = key.trim();
+            (!key.is_empty()).then(|| (key.to_owned(), value.trim().to_owned()))
+        })
+        .collect()
+}
+
+/// The data pairs `entity` carries.
+fn entity_data(entity: &codec::EntityType) -> Vec<(String, String)> {
+    entity
+        .common()
+        .extended_data
+        .get_record(DATA_APP)
+        .map(|record| {
+            record
+                .values
+                .iter()
+                .filter_map(|value| match value {
+                    codec::xdata::XDataValue::String(pair) => data_pairs(pair).into_iter().next(),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Writes `pairs` onto `entity`, over the values of the same keys it had.
+fn write_data(entity: &mut codec::EntityType, pairs: &[(String, String)]) {
+    let mut data = entity_data(entity);
+    for (key, value) in pairs {
+        match data
+            .iter_mut()
+            .find(|(seen, _)| seen.eq_ignore_ascii_case(key))
+        {
+            Some(entry) => entry.1 = value.clone(),
+            None => data.push((key.clone(), value.clone())),
+        }
+    }
+    let mut record = codec::xdata::ExtendedDataRecord::new(DATA_APP);
+    for (key, value) in data {
+        record.add_value(codec::xdata::XDataValue::String(format!("{key}={value}")));
+    }
+    entity.common_mut().extended_data.upsert_record(record);
 }
 
 /// A closed curve on a plane facing up as one hatch boundary edge, in world

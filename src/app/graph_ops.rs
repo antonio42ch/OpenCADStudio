@@ -1697,6 +1697,107 @@ mod tests {
         assert_eq!(app.tabs[i].graph.revision, revision);
     }
 
+    /// Areas grouped by kind into a drawn schedule and a CSV file, labels on
+    /// curves, and data tagged onto drawn objects and read back.
+    #[test]
+    fn schedules_labels_data_and_csv() {
+        let mut app = app();
+        let i = app.active_tab;
+        let csv = std::env::temp_dir().join(format!("ocs-graph-{}.csv", std::process::id()));
+        let _ = std::fs::remove_file(&csv);
+        app.tabs[i].scene.ensure_layer("Rooms");
+        app.tabs[i].active_layer = "Rooms".to_owned();
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        app.tabs[i].active_layer = "0".to_owned();
+        let built = apply_changes(
+            &mut app,
+            "s1",
+            json!([
+                {"add": "Table", "name": "Rooms", "values": {"table": [
+                    ["kind", "area"], ["office", 12], ["bath", 4], ["office", 10.5]]}},
+                {"add": "Text", "source": "builtin", "name": "File", "values": {"value": csv.to_string_lossy()}},
+                {"add": "Text", "source": "builtin", "name": "Layer", "values": {"value": "Rooms"}},
+                {"add": "Text", "source": "builtin", "name": "Tag", "values": {"value": "segment=A; width=3.5"}},
+                {"add": "Text", "source": "builtin", "name": "Key", "values": {"value": "width"}},
+                {"add": "Text", "source": "builtin", "name": "Bad", "values": {"value": "a * (b"}},
+                {"add": "Group By", "name": "Per kind"},
+                {"link": "Rooms.column 1", "to": "Per kind.keys"},
+                {"link": "Rooms.column 2", "to": "Per kind.values"},
+                {"add": "Zip", "name": "Schedule"},
+                {"link": "Per kind.keys", "to": "Schedule.a"},
+                {"link": "Per kind.sums", "to": "Schedule.b"},
+                {"add": "Draw Table", "name": "Sheet"},
+                {"link": "Schedule.rows", "to": "Sheet.rows"},
+                {"add": "Write CSV", "name": "Export"},
+                {"link": "Schedule.rows", "to": "Export.rows"},
+                {"link": "File.value", "to": "Export.path"},
+                {"add": "Read CSV", "name": "Import"},
+                {"link": "File.value", "to": "Import.path"},
+                {"add": "Layer Objects", "name": "Drawn"},
+                {"link": "Layer.value", "to": "Drawn.layer"},
+                {"add": "Tag Objects", "name": "Mark"},
+                {"link": "Drawn.objects", "to": "Mark.objects"},
+                {"link": "Tag.value", "to": "Mark.data"},
+                {"add": "Object Data", "name": "Width"},
+                {"link": "Drawn.objects", "to": "Width.object"},
+                {"link": "Key.value", "to": "Width.key"},
+                {"add": "Curve Label", "name": "Name"},
+                {"link": "Drawn.curves", "to": "Name.curve"},
+                {"link": "Layer.value", "to": "Name.text"},
+                {"add": "Expression", "name": "Broken"},
+                {"link": "Bad.value", "to": "Broken.expression"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Per kind", "sums"), json!([22.5, 4.0]));
+        // A 2 × 2 table: 3 + 3 lines and 4 texts.
+        assert_eq!(
+            node(&state, "sequence", "Sheet")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(10)
+        );
+        assert_eq!(port_value(&state, "Export", "written"), json!(true));
+        assert_eq!(
+            std::fs::read_to_string(&csv).unwrap(),
+            "office,22.5\nbath,4\n"
+        );
+        // Nothing orders the read after the write: the next run reads it.
+        let _ = app.graph_run(i);
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(port_value(&state, "Import", "column 2"), json!([4.0]));
+        assert_eq!(port_value(&state, "Width", "value"), json!([3.5]));
+        assert_eq!(
+            node(&state, "sequence", "Name")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        let label = app.tabs[i]
+            .scene
+            .document
+            .entities()
+            .find_map(|entity| match entity {
+                codec::EntityType::Text(text) if text.value == "Rooms" => Some(text.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            label.alignment_point.map(|at| (at.x, at.y)),
+            Some((5.0, 0.0))
+        );
+        let issues = &node(&state, "sequence", "Broken")["issues"];
+        assert!(
+            issues[0]
+                .as_str()
+                .unwrap()
+                .starts_with("The formula does not read"),
+            "{issues}"
+        );
+        let _ = std::fs::remove_file(&csv);
+    }
+
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {
         let query = app.automation_op(&format!(
             r#"{{"op":"query","type":"{kind}","detail":"summary"}}"#

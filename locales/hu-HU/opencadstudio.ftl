@@ -7327,3 +7327,17 @@ node-help =
     .clipboard-no-nodes = The clipboard holds no nodes
     .nodes-copied = __ocs_fmt_0__ nodes copied
     .nodes-pasted = __ocs_fmt_0__ nodes pasted
+    .op-interpolate-values = Reads a value off a table of points by straight lines between them: the y at an x, such as the elevation at a station from the stations and elevations of a profile. Beyond the ends, the end values hold.
+    .op-group-by = Gathers values by their keys, such as lengths by layer or areas by kind: each key once, the sum and count of its values, and the values of each key.
+    .op-read-csv = Reads a CSV or text table file, its path relative to the drawing's folder, read again each time the graph runs: each column as a list, the rows and their count, as a Table gives them.
+    .op-write-csv = Writes rows (lists of cells) as CSV text and, when a path is given, to that .csv or .txt file next to the drawing; whether it was written.
+    .op-object-data = The data value an object carries under a key, as Tag Objects or a drawing node writes it; with no key, all of its data as key=value texts.
+    .op-distance-along-curve = Where a point stands along a curve: the distance along it to the closest point (a station), the offset to its left (negative to its right), that closest point and the curve's angle there.
+    .object-draw-table = Draw Table
+    .object-curve-label = Curve Label
+    .object-tag-objects = Tag Objects
+    .object-draw-table-help = Draws rows of cells as a table of lines and texts at a point: a schedule of areas, stations or openings. Columns fit their texts unless a width is given.
+    .object-curve-label-help = Writes a text on each curve, at a distance along it (the middle when unset) and an offset to its left, turned to follow the curve and kept readable.
+    .object-tag-objects-help = Writes data onto drawn objects, such as kind=door; segment=A, without owning them, so Object Data and Layer Objects can sort them later.
+    .curve-label = Curve
+    .formula-issue = The formula does not read: __ocs_fmt_0__

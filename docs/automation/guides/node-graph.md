@@ -73,6 +73,14 @@ Along a curve, **Frame At Distance** gives the plane, point, tangent, perpendicu
 
 **Layer Objects** reads the drawn objects on a `layer` (of a `type` such as `Line` when given) as `objects`, their `curves` and a `count`, leaving out what the graph draws. The graph runs again by itself after an edit changes what such a node reads, so hand-drawn axes or outlines on a layer drive the graph; undo and redo do not re-run it.
 
+Results go out as drawings and files. **Draw Table** draws `rows` (lists of cells, such as **Zip** gives) as a table of lines and texts with its top left corner at `point`, `height` the text height and `width` a fixed column width (columns fit their texts when unset). **Curve Label** writes `text` on each `curve` at a `distance` along it (the middle when unset) and an `offset` to its left, turned to follow it and kept readable. **Group By** gathers `values` by `keys` into each key's sum, count and values: lengths per layer, areas per kind. **Read CSV** reads a CSV or text table (its `path` relative to the drawing's folder) as a Table does, and **Write CSV** writes `rows` as CSV to a `.csv` or `.txt` `path`; a file written and read in one graph is read on the next run.
+
+Every drawing node takes `data`, text such as `kind=door; segment=A` it stores on its entities (XDATA under `OCS_DATA`); **Tag Objects** writes it onto drawn objects it does not own, such as those a Layer Objects node reads, and **Object Data** reads one `key` back (all pairs when empty), so data sorts objects through Filter or Group By.
+
+For profiles, **Distance Along Curve** gives a point's station along an alignment, its signed `offset` (left positive), the foot point and the curve's angle there, and **Interpolate Values** reads a `y` at an `x` from two parallel lists, such as an elevation at a station from a profile's stations and elevations.
+
+A formula or condition that does not read shows why in the node's issues, such as "The formula does not read: unknown name `q`".
+
 Nested lists are the graph's trees: Graft, Flatten Once, List Depth, Cross Reference, Weave, Shift List and Cull Pattern reshape them, and a list reaching a step's single-value input runs the step once per element, recursively.
 
 ## Rules and errors

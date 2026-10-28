@@ -7343,3 +7343,17 @@ node-help =
     .clipboard-no-nodes = El portapapeles no contiene nodos
     .nodes-copied = __ocs_fmt_0__ nodos copiados
     .nodes-pasted = __ocs_fmt_0__ nodos pegados
+    .op-interpolate-values = Lee un valor en una tabla de puntos uniéndolos con rectas: la y en una x, como la cota en una progresiva a partir de las progresivas y cotas de un perfil. Fuera de los extremos se mantienen los valores de los extremos.
+    .op-group-by = Reúne valores por sus claves, como longitudes por capa o áreas por tipo: cada clave una vez, la suma y la cantidad de sus valores, y los valores de cada clave.
+    .op-read-csv = Lee un archivo CSV o de texto con una tabla, con la ruta relativa a la carpeta del dibujo, de nuevo cada vez que el grafo se ejecuta: cada columna como una lista, las filas y su cantidad, como las da una Table.
+    .op-write-csv = Escribe filas (listas de celdas) como texto CSV y, si se da una ruta, en ese archivo .csv o .txt junto al dibujo; indica si se escribió.
+    .op-object-data = El dato que un objeto guarda bajo una clave, tal como lo escribe Tag Objects o un nodo de dibujo; sin clave, todos sus datos como textos clave=valor.
+    .op-distance-along-curve = Dónde está un punto a lo largo de una curva: la distancia sobre ella hasta el punto más cercano (una progresiva), el desplazamiento a su izquierda (negativo a la derecha), ese punto más cercano y el ángulo de la curva allí.
+    .object-draw-table = Dibujar tabla
+    .object-curve-label = Etiqueta en curva
+    .object-tag-objects = Etiquetar objetos
+    .object-draw-table-help = Dibuja filas de celdas como una tabla de líneas y textos en un punto: un cuadro de áreas, progresivas o vanos. Las columnas se ajustan a sus textos salvo que se dé un ancho.
+    .object-curve-label-help = Escribe un texto en cada curva, a una distancia sobre ella (el medio si no se indica) y desplazado a su izquierda, girado para seguir la curva y siempre legible.
+    .object-tag-objects-help = Escribe datos en objetos dibujados, como tipo=puerta; tramo=A, sin adueñarse de ellos, para que Object Data y Layer Objects puedan clasificarlos después.
+    .curve-label = Curva
+    .formula-issue = La fórmula no se puede leer: __ocs_fmt_0__
