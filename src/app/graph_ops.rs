@@ -38,6 +38,7 @@ const VERBS: &[&str] = &[
     "composite",
     "expand",
     "save_composite",
+    "edit_script",
 ];
 
 /// A refused change.
@@ -248,6 +249,43 @@ pub(crate) fn composite_ports(composite: &graph::Composite) -> Vec<Field> {
             .map_or(Expect::Any, Expect::of_type),
     });
     inputs.chain(outputs).collect()
+}
+
+/// How to write a script node, for automation clients.
+fn script_api() -> Value {
+    json!({
+        "add": {"add": {"script": {"name": "Posts", "source": "…"}}},
+        "edit": {"edit_script": "Posts", "source": "…"},
+        "language": "Rhai (https://rhai.rs): let, if, for x in list, while, loop, fn, arrays [..], maps #{..}",
+        "header": "The first comment lines declare the ports: // inputs: name: kind = default, … and // outputs: name: kind, …. Kinds: number, text, bool, point, vector, curve, plane, geometry, any; add [] for an input that takes a whole list. An input without [] runs the script once per element of a list linked to it. Defaults are JSON.",
+        "result": "End with a map of the outputs, #{ name: value, … }, or the value of the only output.",
+        "values": "Numbers, text, bools, arrays and maps; points are #{x, y, z}; curves are the curve values graph_state shows; drawn objects arrive as their curves.",
+        "functions": [
+            "point(x, y) / point(x, y, z)", "line(a, b)", "polyline(points) / polyline(points, closed)",
+            "circle(center, radius)", "length(curve)", "point_at(curve, distance)", "angle_at(curve, distance)",
+            "offset(curve, distance)", "distance(a, b)", "sind / cosd / tand (degrees), atan2d(y, x)",
+            "op(\"Node name\", #{ input: value, … }): any computing node of graph_library; its only output, or a map of its outputs"
+        ],
+        "limits": format!("At most {} operations per run; no files, drawing, clock or printing.", graph::script::MAX_OPERATIONS),
+        "errors": "A script that does not read is refused with invalid_script and its line; one that fails while running shows the reason in its issues.",
+        "template": graph::script::TEMPLATE,
+    })
+}
+
+/// A script read from `source`, refused with why when it does not read.
+fn compiled(
+    name: &str,
+    source: &str,
+) -> Result<std::sync::Arc<graph::script::Script>, ChangeError> {
+    let script = graph::script::Script::new(name, source);
+    match &script.error {
+        Some(why) => Err(fail_hint(
+            "invalid_script",
+            format!("The script does not read: {why}"),
+            "Read graph_library's script_api for the header and functions",
+        )),
+        None => Ok(script),
+    }
 }
 
 fn resolve_node(graph: &Graph, reference: &Value) -> Result<NodeId, ChangeError> {
@@ -561,7 +599,7 @@ fn apply_one(
     let mut result = json!({ "index": index, "change": verb });
     match verb {
         "add" | "adopt" => {
-            let (item, handles) = if verb == "adopt" {
+            let (kind, handles) = if verb == "adopt" {
                 let text = text_of(change, "adopt")?;
                 let handle = u64::from_str_radix(text.trim_start_matches("0x"), 16)
                     .map(Handle::new)
@@ -572,17 +610,41 @@ fn apply_one(
                         format!("Entity {text} already belongs to a node"),
                     ));
                 }
-                (PaletteItem::Object(drawing.entity(handle)?), vec![handle])
+                (
+                    PaletteItem::Object(drawing.entity(handle)?).kind(),
+                    vec![handle],
+                )
             } else {
                 let ty = &change["add"];
-                if ty.get("script").is_some() {
-                    return Err(fail_hint(
-                        "not_supported",
-                        "Script nodes are not available yet",
-                        "Use node types from graph_library",
-                    ));
-                }
-                if let Some(wanted) = ty.get("composite") {
+                if let Some(script) = ty.get("script") {
+                    // A saved script by its name, or a program of its own.
+                    let saved = script["library"].as_str().map(|wanted| {
+                        crate::ui::node_graph::script_library()
+                            .into_iter()
+                            .find(|saved| saved.name.eq_ignore_ascii_case(wanted.trim()))
+                            .ok_or_else(|| {
+                                fail_hint(
+                                    "unknown_type",
+                                    format!("The script library has no {wanted}"),
+                                    "Read graph_library with search: script",
+                                )
+                            })
+                    });
+                    let saved = saved.transpose()?;
+                    let source = saved.as_ref().map(|saved| saved.source.as_str());
+                    let source = source.or(script["source"].as_str()).ok_or_else(|| {
+                        fail_hint(
+                            "invalid_script",
+                            "A script needs its source",
+                            "Read graph_library's script_api for the header and functions",
+                        )
+                    })?;
+                    let name = script["name"]
+                        .as_str()
+                        .or(saved.as_ref().map(|saved| saved.name.as_str()))
+                        .unwrap_or("Script");
+                    (Some(Kind::Script(compiled(name, source)?)), Vec::new())
+                } else if let Some(wanted) = ty.get("composite") {
                     let name = wanted.as_str().unwrap_or_default();
                     let library = crate::ui::node_graph::composite_library();
                     let k = library
@@ -597,19 +659,26 @@ fn apply_one(
                                 "Read graph_library with search: composite",
                             )
                         })?;
-                    (PaletteItem::Composite(k), Vec::new())
+                    (PaletteItem::Composite(k).kind(), Vec::new())
                 } else {
                     let name = ty
                         .as_str()
                         .ok_or_else(|| fail("invalid_change", "add names a node type"))?;
-                    (resolve_type(name, change["source"].as_str())?, Vec::new())
+                    (
+                        resolve_type(name, change["source"].as_str())?.kind(),
+                        Vec::new(),
+                    )
                 }
             };
-            let kind = item
-                .kind()
-                .ok_or_else(|| fail("unknown_type", "That library entry is gone"))?;
+            let kind = kind.ok_or_else(|| fail("unknown_type", "That library entry is gone"))?;
+            // A script goes by its own name unless the change names it.
+            let own = match &kind {
+                Kind::Script(script) => Some(script.name.clone()),
+                _ => None,
+            };
             let wanted = change["name"]
                 .as_str()
+                .or(own.as_deref())
                 .map(str::trim)
                 .filter(|name| !name.is_empty());
             let name = match wanted {
@@ -927,6 +996,34 @@ fn apply_one(
             result["saved"] = json!(saved.name);
             report.saved.push(std::sync::Arc::new(saved));
         }
+        "edit_script" => {
+            let id = resolve_node(graph, &change["edit_script"])?;
+            let Some(Kind::Script(old)) = graph.engine.node(id).map(|node| node.kind.clone())
+            else {
+                return Err(fail(
+                    "not_a_script",
+                    format!("{} is not a script node", graph.name(id)),
+                ));
+            };
+            let source = change["source"].as_str().unwrap_or(&old.source);
+            let name = change["name"].as_str().unwrap_or(&old.name).to_owned();
+            compiled(&name, source)?;
+            let before: Vec<Link> = graph.engine.links.clone();
+            graph.apply_script(id, name, source.to_owned());
+            let dropped: Vec<Value> = before
+                .iter()
+                .filter(|link| {
+                    !graph
+                        .engine
+                        .links
+                        .iter()
+                        .any(|kept| kept.from == link.from && kept.to == link.to)
+                })
+                .map(|link| link_json(graph, link))
+                .collect();
+            result["node"] = json!(graph.name(id));
+            result["links_dropped"] = json!(dropped);
+        }
         _ => unreachable!("verbs are listed above"),
     }
     report.results.push(result);
@@ -992,6 +1089,9 @@ fn node_json(
         "position": position,
         "group": group,
     });
+    if let Kind::Script(script) = &node.kind {
+        value["script"] = json!(script.source);
+    }
     if let Some(ui) = ui.filter(|ui| !ui.handles.is_empty()) {
         value["entities"] = json!(ui
             .handles
@@ -1143,13 +1243,29 @@ impl OpenCADStudio {
                 "outputs": fields.iter().filter(|field| field.output).map(port).collect::<Vec<_>>(),
             }));
         }
+        for script in crate::ui::node_graph::script_library() {
+            if !wanted(&script.name, "Scripts") && !wanted("script", "Scripts") {
+                continue;
+            }
+            let fields = script_ports(&script);
+            types.push(json!({
+                "type": script.name,
+                "source": "script",
+                "category": "Scripts",
+                "area": "sequence",
+                "add": { "add": { "script": { "library": script.name } } },
+                "script": script.source,
+                "inputs": fields.iter().filter(|field| field.input).map(port).collect::<Vec<_>>(),
+                "outputs": fields.iter().filter(|field| field.output).map(port).collect::<Vec<_>>(),
+            }));
+        }
         json!({
             "ok": true,
             "status": "completed",
             "count": types.len(),
             "types": types,
-            "sources": ["builtin", "object", "composite"],
-            "reserved_sources": ["script"],
+            "sources": ["builtin", "object", "composite", "script"],
+            "script_api": script_api(),
         })
     }
 
@@ -1457,7 +1573,7 @@ mod tests {
             .unwrap()
             .iter()
             .any(|port| port["computed"] == true));
-        assert_eq!(library["reserved_sources"], json!(["script"]));
+        assert!(library["script_api"]["template"].is_string());
     }
 
     #[test]
@@ -1530,7 +1646,7 @@ mod tests {
         let ambiguous = refused(&mut app, "r6", json!([{"add": "Point"}]));
         assert_eq!(ambiguous["code"], "ambiguous_type");
         let script = refused(&mut app, "r7", json!([{"add": {"script": {}}}]));
-        assert_eq!(script["code"], "not_supported");
+        assert_eq!(script["code"], "invalid_script");
         // The first change is fine; the second fails, so neither lands.
         let partial = refused(
             &mut app,
@@ -1905,6 +2021,153 @@ mod tests {
             .collect();
         assert_eq!(before, after);
         assert_eq!(app.tabs[i].scene.geometry_epoch, epoch, "nothing redrawn");
+    }
+
+    /// A script added, linked and edited through automation: posts along
+    /// a drawn line, a refused program and a failing one.
+    #[test]
+    fn scripts_are_added_edited_and_checked_by_automation() {
+        let mut app = app();
+        let i = app.active_tab;
+        app.tabs[i].scene.ensure_layer("Axis");
+        app.tabs[i].active_layer = "Axis".to_owned();
+        app.automation_op(r#"{"op":"run","cmd":"LINE 0,0 10,0"}"#);
+        app.tabs[i].active_layer = "0".to_owned();
+        let posts = "// inputs: axis: curve, spacing: number = 2.5\n// outputs: posts: point[], count: number\n\
+            let posts = [];\nlet d = 0.0;\nwhile d <= length(axis) + 1e-9 {\n    posts.push(point_at(axis, d));\n    d += spacing;\n}\n\
+            #{ posts: posts, count: posts.len() }";
+        let built = apply_changes(
+            &mut app,
+            "sc1",
+            json!([
+                {"add": "Text", "source": "builtin", "name": "Layer", "values": {"value": "Axis"}},
+                {"add": "Number", "name": "Spacing", "values": {"value": 5}},
+                {"add": "Layer Objects", "name": "Drawn"},
+                {"link": "Layer.value", "to": "Drawn.layer"},
+                {"add": {"script": {"name": "Posts", "source": posts}}},
+                {"link": "Drawn.objects", "to": "Posts.axis"},
+                {"link": "Spacing.value", "to": "Posts.spacing"},
+                {"add": "Circle Curve", "name": "Rings"},
+                {"link": "Posts.posts", "to": "Rings.center"},
+                {"add": "Draw Geometry", "name": "Draw rings"},
+                {"link": "Rings.curve", "to": "Draw rings.geometry"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let state = read(&mut app, "graph_state", json!({}));
+        // A list of one line runs the script once: one list of 3 posts.
+        assert_eq!(port_value(&state, "Posts", "count"), json!([3]));
+        assert_eq!(node(&state, "sequence", "Posts")["source"], "script");
+        assert!(node(&state, "sequence", "Posts")["script"]
+            .as_str()
+            .unwrap()
+            .contains("point_at"));
+        assert_eq!(
+            node(&state, "sequence", "Draw rings")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(3)
+        );
+
+        let refused = apply_changes(
+            &mut app,
+            "sc2",
+            json!([{"edit_script": "Posts", "source": "// outputs: n\nlet = 1;"}]),
+        );
+        assert_eq!(refused["code"], "invalid_script", "{refused}");
+        assert!(
+            refused["error"].as_str().unwrap().contains("line 2"),
+            "{refused}"
+        );
+
+        // Renaming the output drops the link that read it.
+        let edited = apply_changes(
+            &mut app,
+            "sc3",
+            json!([{"edit_script": "Posts", "source": "// inputs: axis: curve\n// outputs: middle: point\npoint_at(axis, length(axis) / 2.0)"}]),
+        );
+        assert_eq!(edited["ok"], true, "{edited}");
+        let dropped = edited["result"]["changes"][0]["links_dropped"]
+            .as_array()
+            .map(Vec::len);
+        assert_eq!(dropped, Some(2), "spacing and posts are gone: {edited}");
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            port_value(&state, "Posts", "middle"),
+            json!([{"x": 5.0, "y": 0.0, "z": 0.0}])
+        );
+
+        let failing = apply_changes(
+            &mut app,
+            "sc4",
+            json!([{"add": {"script": {"name": "Loop", "source": "// outputs: y: number\nlet n = 0;\nloop { n += 1; }"}}}]),
+        );
+        assert_eq!(failing["ok"], true);
+        let state = read(&mut app, "graph_state", json!({}));
+        let issue = node(&state, "sequence", "Loop")["issues"][0]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(issue.starts_with("Script: line 3"), "{issue}");
+        let library = read(&mut app, "graph_library", json!({}));
+        assert!(library["sources"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("script")));
+    }
+
+    /// A graph file holding scripts opens paused: nothing runs or draws
+    /// until the user lets its scripts run.
+    #[test]
+    fn opened_scripts_wait_for_the_users_word() {
+        let mut app = app();
+        let i = app.active_tab;
+        let built = apply_changes(
+            &mut app,
+            "t1",
+            json!([
+                {"add": {"script": {"name": "Unit", "source": "// outputs: c: curve\ncircle(point(0.0, 0.0), 1.0)"}}},
+                {"add": "Draw Geometry", "name": "Draw"},
+                {"link": "Unit.c", "to": "Draw.geometry"},
+            ]),
+        );
+        assert_eq!(built["ok"], true, "{built}");
+        let first = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            node(&first, "sequence", "Draw")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(1),
+            "{first}"
+        );
+        let bytes = app.tabs[i].graph.to_file("");
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::New);
+        let _ = app.on_graph(crate::ui::node_graph::GraphMsg::Loaded(Some(bytes)));
+        let graph = &app.tabs[i].graph;
+        let fingerprint = graph.script_fingerprint().unwrap();
+        assert_eq!(
+            graph.scripts_paused,
+            !crate::ui::node_graph::scripts_trusted(fingerprint)
+        );
+        if graph.scripts_paused {
+            let script = graph
+                .engine
+                .nodes
+                .iter()
+                .find(|node| matches!(node.kind, Kind::Script(_)))
+                .unwrap();
+            assert!(script.outputs.is_empty(), "not run");
+            // What Run scripts does, without remembering the choice here.
+            app.tabs[i].graph.scripts_paused = false;
+            let _ = app.graph_run(i);
+        }
+        let state = read(&mut app, "graph_state", json!({}));
+        assert_eq!(
+            node(&state, "sequence", "Draw")["entities"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
     }
 
     fn count_lines(app: &mut OpenCADStudio, kind: &str) -> usize {

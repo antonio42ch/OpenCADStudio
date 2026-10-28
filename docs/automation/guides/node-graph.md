@@ -13,7 +13,7 @@ Nodes have unique names (case-insensitive). Address a node by name or as `#id`, 
 
 ## Read
 
-- `ocs_read` `op: graph_library` lists every node type with `source` (`builtin` or `object`; `composite` and `script` are reserved), `category`, `area` (`inputs` or `sequence`), a one-line `description` of what it does, and its ports with `kind` (`number`, `text`, `bool`, `point`, `curve`, `plane`, `object` or `any`; vectors are `point`). Filter with `parameters.search` or pick one type with `parameters.name`.
+- `ocs_read` `op: graph_library` lists every node type with `source` (`builtin`, `object`, `composite` or `script`), a `script_api` describing how to write scripts, `category`, `area` (`inputs` or `sequence`), a one-line `description` of what it does, and its ports with `kind` (`number`, `text`, `bool`, `point`, `curve`, `plane`, `object` or `any`; vectors are `point`). Filter with `parameters.search` or pick one type with `parameters.name`.
 - `ocs_read` `op: graph_state` returns `graph_revision`, the `inputs` and `sequence` nodes in order, with their names, types, groups, entities and ports (value, kind, `computed`, and `source` when linked), and the groups. A step that gave no result lists why in `issues`: `Nothing feeds <input>`, `The list on <input> is empty`, `No result with these values` (a size of zero, coincident points…), or, for a composite, the step inside and its issue. Read them after an apply and fix what they name. `parameters.detail: summary` leaves out the ports.
 - `ocs_read` `op: graph_validate` with `parameters.request` holding a `graph_apply` request applies it to a copy of the live graph and reports `valid`, per-change results, warnings and the links it would drop, without changing anything.
 
@@ -56,6 +56,7 @@ Nodes have unique names (case-insensitive). Address a node by name or as `#id`, 
 | `composite` | list of steps, `name`: one composite node in their place (see below) |
 | `expand` | composite node: its steps back in its place, named as they were, in a group |
 | `save_composite` | composite node; optional `name`: saved to the user's composite library |
+| `edit_script` | script node, `source` and/or `name`: its new program; values of kept inputs stay, links to ports it no longer has are dropped |
 
 The result lists each change's outcome (`node`, `id`, `links_dropped`), `warnings`, the new `graph_revision` and the node names.
 
@@ -87,6 +88,26 @@ A formula or condition that does not read shows why in the node's issues, such a
 
 Nested lists are the graph's trees: Graft, Flatten Once, List Depth, Cross Reference, Weave, Shift List and Cull Pattern reshape them, and a list reaching a step's single-value input runs the step once per element, recursively.
 
+## Scripts
+
+A script node is a step whose computation is a short [Rhai](https://rhai.rs) program, for logic that is awkward as nodes: loops, nested conditions, design rules. Add one with `{"add": {"script": {"name": "Posts", "source": "…"}}}` (or `{"script": {"library": "Posts"}}` for a saved one) and change it with `edit_script`; `graph_state` gives each script node's `script` source. Its first comment lines declare its ports:
+
+```rhai
+// inputs: axis: curve, spacing: number = 2.5
+// outputs: posts: point[], count: number
+let posts = [];
+let d = 0.0;
+while d <= length(axis) {
+    posts.push(point_at(axis, d));
+    d += spacing;
+}
+#{ posts: posts, count: posts.len() }
+```
+
+Kinds are `number`, `text`, `bool`, `point`, `vector`, `curve`, `plane`, `geometry` and `any`; `[]` makes an input take a whole list, while an input without it runs the script once per element of a list linked to it, as for any node. Defaults are JSON. The program ends with a map of its outputs, or the value of its only output. Points are `#{x, y, z}`, curves the curve values the graph uses, and drawn objects arrive as their curves. Besides Rhai itself, scripts have `point`, `line`, `polyline`, `circle`, `length`, `point_at`, `angle_at`, `offset`, `distance`, `sind`/`cosd`/`tand`/`atan2d` (degrees) and `op("Node name", #{input: value})`, which runs any computing node of the library; `graph_library`'s `script_api` lists them.
+
+Scripts only compute: they cannot read files, the drawing or the clock, and a run stops after its budget of operations, so a runaway loop becomes an issue (`Script: line 3: …`) rather than a hang. Drawing nodes draw what they return. A program that does not read is refused with `invalid_script` and its line. A graph file holding scripts the user has not run before opens paused, as it was saved, until the user presses Run scripts; changes made through automation run at once.
+
 ## Rules and errors
 
 The first refused change stops the request and nothing is applied; the error carries its `index`, a `code` and often a `hint`.
@@ -97,7 +118,7 @@ The first refused change stops the request and nothing is applied; the error car
 - `unknown_node`, `unknown_port`, `unknown_type`, `ambiguous_type`, `unknown_group`, `invalid_value`, `invalid_change`, `wrong_area`, `mixed_areas`.
 - `entity_absent`, `entity_owned`, `unsupported_entity`, `invalid_handle` for `adopt`.
 - `invalid_composite`: a composite takes operation steps only (no inputs, objects or Draw Geometry), and no other step may both read from the gathered steps and feed them.
-- `not_supported`: `{"add": {"script": …}}` is reserved for script nodes.
+- `invalid_script`: a script whose header or program does not read; the error names the line. `not_a_script` for `edit_script` on another node.
 
 Warnings do not stop the request: `name_taken` (the node got a numbered name), `type_mismatch` (linked kinds differ), `not_linked`.
 

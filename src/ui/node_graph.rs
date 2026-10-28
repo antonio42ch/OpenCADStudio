@@ -315,6 +315,10 @@ pub enum PaletteItem {
     Op(&'static Spec),
     /// An entry of the composite library, by position.
     Composite(usize),
+    /// A script node from the starting template.
+    NewScript,
+    /// An entry of the script library, by position.
+    Script(usize),
 }
 
 impl PaletteItem {
@@ -327,6 +331,11 @@ impl PaletteItem {
                 .get(k)
                 .map(|composite| composite.name.clone())
                 .unwrap_or_default(),
+            PaletteItem::NewScript => t!("New script").into_owned(),
+            PaletteItem::Script(k) => script_library()
+                .get(k)
+                .map(|script| script.name.clone())
+                .unwrap_or_default(),
         }
     }
 
@@ -336,6 +345,14 @@ impl PaletteItem {
             PaletteItem::Object(kind) => Kind::Object(kind.name().to_owned()),
             PaletteItem::Op(spec) => Kind::Op(spec),
             PaletteItem::Composite(k) => Kind::Composite(composite_library().get(k)?.clone()),
+            PaletteItem::NewScript => Kind::Script(Script::new(
+                t!("Script").into_owned(),
+                graph::script::TEMPLATE,
+            )),
+            PaletteItem::Script(k) => {
+                let saved = script_library().get(k)?.clone();
+                Kind::Script(Script::new(saved.name.clone(), saved.source.clone()))
+            }
         })
     }
 }
@@ -452,6 +469,123 @@ pub fn forget_library_entry(k: usize) {
     }
 }
 
+// ── Script library and trusted scripts ───────────────────────────────────
+// Scripts the user saved, offered in the palette like composites, and the
+// fingerprints of the scripts of opened files the user chose to run.
+
+const SCRIPTS_FILE: &str = "node_scripts.json";
+const TRUSTED_FILE: &str = "node_trusted_scripts.json";
+
+/// The text kept under `file` in the config folder (local storage on the
+/// web).
+fn read_store(file: &str) -> Option<String> {
+    #[cfg(not(target_arch = "wasm32"))]
+    return crate::config::config_dir()
+        .and_then(|dir| std::fs::read_to_string(dir.join(file)).ok());
+    #[cfg(target_arch = "wasm32")]
+    return web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| {
+            storage
+                .get_item(&format!("opencadstudio.{file}"))
+                .ok()
+                .flatten()
+        });
+}
+
+fn write_store(file: &str, body: &str) {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(dir) = crate::config::config_dir() {
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join(file), body);
+    }
+    #[cfg(target_arch = "wasm32")]
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        let _ = storage.set_item(&format!("opencadstudio.{file}"), body);
+    }
+}
+
+fn script_store() -> &'static std::sync::Mutex<Vec<Arc<Script>>> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<Arc<Script>>>> =
+        std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        let items = read_store(SCRIPTS_FILE)
+            .and_then(|body| serde_json::from_str::<Vec<Value>>(&body).ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|item| Script::from_json(item).ok())
+            .collect();
+        std::sync::Mutex::new(items)
+    })
+}
+
+/// The saved scripts, in the order the palette lists them.
+pub fn script_library() -> Vec<Arc<Script>> {
+    script_store()
+        .lock()
+        .map(|items| items.clone())
+        .unwrap_or_default()
+}
+
+/// Saves `script` to the library, replacing one of the same name.
+pub fn save_script(script: Arc<Script>) {
+    if let Ok(mut items) = script_store().lock() {
+        let name = script.name.to_lowercase();
+        match items
+            .iter()
+            .position(|item| item.name.to_lowercase() == name)
+        {
+            Some(k) => items[k] = script,
+            None => items.push(script),
+        }
+        let body = Value::Array(items.iter().map(|item| item.to_json()).collect()).to_string();
+        write_store(SCRIPTS_FILE, &body);
+    }
+}
+
+/// Drops script library entry `k`.
+pub fn forget_script(k: usize) {
+    if let Ok(mut items) = script_store().lock() {
+        if k < items.len() {
+            items.remove(k);
+            let body = Value::Array(items.iter().map(|item| item.to_json()).collect()).to_string();
+            write_store(SCRIPTS_FILE, &body);
+        }
+    }
+}
+
+fn trusted_store() -> &'static std::sync::Mutex<Vec<u64>> {
+    static STORE: std::sync::OnceLock<std::sync::Mutex<Vec<u64>>> = std::sync::OnceLock::new();
+    STORE.get_or_init(|| {
+        let items = read_store(TRUSTED_FILE)
+            .and_then(|body| serde_json::from_str(&body).ok())
+            .unwrap_or_default();
+        std::sync::Mutex::new(items)
+    })
+}
+
+/// Whether the user chose to run scripts with this fingerprint before.
+pub fn scripts_trusted(fingerprint: u64) -> bool {
+    trusted_store()
+        .lock()
+        .is_ok_and(|items| items.contains(&fingerprint))
+}
+
+/// Remembers that the user runs scripts with this fingerprint.
+pub fn trust_scripts(fingerprint: u64) {
+    if let Ok(mut items) = trusted_store().lock() {
+        if !items.contains(&fingerprint) {
+            items.push(fingerprint);
+            write_store(
+                TRUSTED_FILE,
+                &serde_json::to_string(&*items).unwrap_or_default(),
+            );
+        }
+    }
+}
+
 /// What a composite input accepts: what the inner input it stands for does.
 pub(crate) fn composite_expect(composite: &Composite, name: &str) -> Expect {
     composite_type(composite, name, true).map_or(Expect::Any, Expect::of_type)
@@ -477,7 +611,11 @@ pub(crate) fn port_type(kind: &Kind, field: &str, input: bool) -> Option<PortTyp
 
 /// The kind a script's header declares for port `field`.
 pub(crate) fn script_type(script: &Script, field: &str, input: bool) -> Option<PortType> {
-    let ports = if input { &script.inputs } else { &script.outputs };
+    let ports = if input {
+        &script.inputs
+    } else {
+        &script.outputs
+    };
     ports
         .iter()
         .find(|port| port.name == field)
@@ -887,6 +1025,43 @@ pub struct CompositeDraft {
     pub outputs: Vec<(String, String)>,
 }
 
+/// A script node's program being edited: the node, its name, the text and
+/// the result of the last check (its ports, or why it does not read).
+pub struct ScriptDraft {
+    pub node: NodeId,
+    pub name: String,
+    pub content: iced::widget::text_editor::Content,
+    pub checked: Option<Result<String, String>>,
+}
+
+/// What a script's check reports: its ports, or why it does not read.
+fn script_check(source: &str) -> Result<String, String> {
+    let script = Script::new("", source);
+    if let Some(why) = &script.error {
+        return Err(why.clone());
+    }
+    let ports = |ports: &[graph::script::ScriptPort]| {
+        ports
+            .iter()
+            .map(|port| {
+                let kind = port.kind.kind.name();
+                format!(
+                    "{} ({kind}{})",
+                    port.name,
+                    if port.kind.list { "[]" } else { "" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Ok(crate::tf!(
+        "Reads well. Inputs: {} → outputs: {}",
+        ports(&script.inputs),
+        ports(&script.outputs)
+    )
+    .into_owned())
+}
+
 /// A composite's description, kept in its host metadata.
 pub(crate) fn composite_description(composite: &Composite) -> &str {
     composite.meta["description"].as_str().unwrap_or_default()
@@ -1064,6 +1239,8 @@ pub struct Graph {
     pub dragging: Option<NodeId>,
     /// A composite node's name, description and ports being edited.
     pub editing: Option<CompositeDraft>,
+    /// A script node's program being edited.
+    pub scripting: Option<ScriptDraft>,
     /// What is being renamed and its draft name.
     pub renaming: Option<(Renaming, String)>,
     /// An edit waiting for the user to accept the links it breaks.
@@ -1100,6 +1277,9 @@ pub struct Graph {
     pub found: Option<NodeId>,
     /// Steps show as small cards with their results only.
     pub compact: bool,
+    /// The graph was opened with scripts the user has not chosen to run:
+    /// it is not evaluated until they do.
+    pub scripts_paused: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1151,6 +1331,19 @@ pub enum GraphMsg {
     CompositeDraftOutput(usize, String),
     CompositeEditSave,
     CompositeEditCancel,
+    /// Opens the editor of a script node's program.
+    ScriptEdit(NodeId),
+    ScriptName(String),
+    ScriptAction(iced::widget::text_editor::Action),
+    /// Reads the program, reporting its ports or why it does not read.
+    ScriptCheck,
+    ScriptSave,
+    ScriptCancel,
+    /// Saves a script node to the script library.
+    SaveScript(NodeId),
+    ForgetScript(usize),
+    /// Runs the scripts of the graph just opened, and remembers the choice.
+    TrustScripts,
     /// Writes the composite library to a file the user picks.
     LibraryExport,
     /// Adds the composites of a library file the user picks.
@@ -1734,6 +1927,30 @@ impl Graph {
         Some(copy)
     }
 
+    /// A fingerprint of every script's program, inside composites too;
+    /// `None` without scripts.
+    pub fn script_fingerprint(&self) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        fn sources<'g>(graph: &'g graph::Graph, into: &mut Vec<&'g str>) {
+            for node in &graph.nodes {
+                match &node.kind {
+                    Kind::Script(script) => into.push(&script.source),
+                    Kind::Composite(composite) => sources(&composite.graph, into),
+                    _ => {}
+                }
+            }
+        }
+        let mut all = Vec::new();
+        sources(&self.engine, &mut all);
+        if all.is_empty() {
+            return None;
+        }
+        all.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        all.hash(&mut hasher);
+        Some(hasher.finish())
+    }
+
     /// Nodes whose name or type holds the find box's text, in node order.
     pub(crate) fn search_matches(&self) -> Vec<NodeId> {
         let query = self.node_search.trim().to_lowercase();
@@ -2127,6 +2344,50 @@ impl Graph {
     }
 
     /// The editor's starting point for composite node `id`.
+    fn script_draft(&self, id: NodeId) -> Option<ScriptDraft> {
+        let Kind::Script(script) = &self.engine.node(id)?.kind else {
+            return None;
+        };
+        Some(ScriptDraft {
+            node: id,
+            name: script.name.clone(),
+            content: iced::widget::text_editor::Content::with_text(&script.source),
+            checked: Some(script_check(&script.source)),
+        })
+    }
+
+    /// Gives script node `id` a new program: values of inputs it keeps
+    /// stay, new inputs start at their defaults, and links to ports it no
+    /// longer has go.
+    pub(crate) fn apply_script(&mut self, id: NodeId, name: String, source: String) {
+        let name = if name.trim().is_empty() {
+            t!("Script").into_owned()
+        } else {
+            name.trim().to_owned()
+        };
+        let script = Script::new(name, source);
+        let Some(node) = self.engine.node_mut(id) else {
+            return;
+        };
+        let mut params = script.defaults();
+        for (field, value) in params.iter_mut() {
+            if let Some(kept) = node.params.get(field).filter(|kept| !kept.is_null()) {
+                *value = kept.clone();
+            }
+        }
+        node.params = params;
+        node.kind = Kind::Script(script.clone());
+        self.engine.links.retain(|link| {
+            (link.to.node != id || script.inputs.iter().any(|port| port.name == link.to.field))
+                && (link.from.node != id
+                    || script
+                        .outputs
+                        .iter()
+                        .any(|port| port.name == link.from.field))
+        });
+        self.revision += 1;
+    }
+
     fn composite_draft(&self, id: NodeId) -> Option<CompositeDraft> {
         let node = self.engine.node(id)?;
         let Kind::Composite(composite) = &node.kind else {
@@ -2753,8 +3014,9 @@ impl Graph {
         match self.engine.node(target.node).map(|node| &node.kind) {
             Some(Kind::Op(spec)) => spec_expect(spec, &target.field),
             Some(Kind::Composite(composite)) => composite_expect(composite, &target.field),
-            Some(Kind::Script(script)) => script_type(script, &target.field, true)
-                .map_or(Expect::Any, Expect::of_type),
+            Some(Kind::Script(script)) => {
+                script_type(script, &target.field, true).map_or(Expect::Any, Expect::of_type)
+            }
             Some(Kind::Object(_)) => Expect::of_value(value),
             None => Expect::Any,
         }
@@ -2767,6 +3029,8 @@ impl Graph {
             Some(self.confirm_dialog(confirm, &sections))
         } else if let Some(draft) = &self.editing {
             Some(self.composite_editor(draft))
+        } else if let Some(draft) = &self.scripting {
+            Some(self.script_editor(draft))
         } else {
             self.picking
                 .as_ref()
@@ -3049,12 +3313,44 @@ impl Graph {
         ]
         .spacing(2)
         .align_y(iced::Center);
+        let paused: Element<'_, Message> = if self.scripts_paused {
+            container(
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::WARNING, 12.0),
+                    text(t!(
+                        "This graph holds scripts you have not run before. It stays as it was saved until you run them."
+                    ))
+                    .size(11)
+                    .width(Length::Fill),
+                    button(text(t!("Run scripts")).size(11))
+                        .on_press(msg(GraphMsg::TrustScripts))
+                        .style(button::primary)
+                        .padding([3, 10]),
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+            )
+            .padding([6, 8])
+            .style(|_: &Theme| container::Style {
+                background: Some(Background::Color(ISSUE_COLOR.scale_alpha(0.15))),
+                border: Border {
+                    color: ISSUE_COLOR,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+        } else {
+            Space::new().height(0).into()
+        };
         let sequence = column![
             row![
                 text(t!("Node Sequence")).size(13).width(Length::Fill),
                 toolbar
             ]
             .align_y(iced::Center),
+            paused,
             scrollable(container(sequence_body).padding(iced::Padding {
                 top: 0.0,
                 right: 12.0,
@@ -3328,6 +3624,18 @@ impl Graph {
         .align_y(iced::Center);
         for element in extra {
             header = header.push(element);
+        }
+        if matches!(node.kind, Kind::Script(_)) {
+            header = header.push(icon_button(
+                crate::ui::icons::MENU,
+                "Edit script",
+                Some(GraphMsg::ScriptEdit(id)),
+            ));
+            header = header.push(icon_button(
+                crate::ui::icons::SAVE,
+                "Save to the script library",
+                Some(GraphMsg::SaveScript(id)),
+            ));
         }
         if matches!(node.kind, Kind::Composite(_)) {
             header = header.push(icon_button(
@@ -4325,6 +4633,108 @@ impl Graph {
         modal(card.into(), GraphMsg::CompositeEditCancel)
     }
 
+    /// The script editor: the program with its line numbers, where the
+    /// cursor is, the last check, a short reference of what scripts can call,
+    /// and Check, Cancel and Apply.
+    fn script_editor<'a>(&'a self, draft: &'a ScriptDraft) -> Element<'a, Message> {
+        const SIZE: f32 = 12.0;
+        let lines = draft.content.line_count().max(1);
+        let numbers = (1..=lines)
+            .map(|k| k.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let gutter = container(
+            text(numbers)
+                .size(SIZE)
+                .font(iced::Font::MONOSPACE)
+                .align_x(iced::Right)
+                .style(weak_text),
+        )
+        .padding(iced::Padding {
+            top: 5.0,
+            right: 6.0,
+            bottom: 5.0,
+            left: 4.0,
+        });
+        let editor = iced::widget::text_editor(&draft.content)
+            .on_action(|action| msg(GraphMsg::ScriptAction(action)))
+            .font(iced::Font::MONOSPACE)
+            .size(SIZE)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .height(Length::Shrink);
+        let code = scrollable(row![gutter, editor].align_y(iced::Top))
+            .height(Length::Fixed(340.0))
+            .width(Length::Fill);
+        let cursor = draft.content.cursor().position;
+        let status =
+            text(crate::tf!("Line {}, column {}", cursor.line + 1, cursor.column + 1).into_owned())
+                .size(10)
+                .style(weak_text);
+        let check: Element<'_, Message> = match &draft.checked {
+            Some(Ok(ports)) => text(ports.clone()).size(11).into(),
+            Some(Err(why)) => row![
+                crate::ui::icons::themed(crate::ui::icons::WARNING, 11.0),
+                text(why.clone()).size(11).style(|_: &Theme| text::Style {
+                    color: Some(ISSUE_COLOR)
+                })
+            ]
+            .spacing(4)
+            .align_y(iced::Center)
+            .into(),
+            None => text(t!("Press Check to read the program"))
+                .size(11)
+                .style(weak_text)
+                .into(),
+        };
+        let reference = text(t!(
+            "Declare the ports in the first lines: // inputs: name: kind = default, … and // outputs: name: kind, … (kinds: number, text, bool, point, vector, curve, plane, geometry, any; [] for a whole list). End with #{ output: value, … }. Points are #{x, y, z}. Functions: point(x, y), line(a, b), polyline(points), circle(center, r), length(curve), point_at(curve, d), angle_at(curve, d), offset(curve, d), distance(a, b), sind, cosd, tand, atan2d (degrees), and op(\"Node name\", #{ input: value }) for any computing node."
+        ))
+        .size(10)
+        .style(weak_text);
+        let card = container(
+            column![
+                row![
+                    crate::ui::icons::themed(crate::ui::icons::MENU, 16.0),
+                    text(t!("Edit script")).size(13)
+                ]
+                .spacing(8)
+                .align_y(iced::Center),
+                text(t!("Name")).size(10).style(weak_text),
+                text_input("", &draft.name)
+                    .on_input(|name| msg(GraphMsg::ScriptName(name)))
+                    .size(11)
+                    .padding([3, 6])
+                    .width(Length::Fill),
+                container(code).style(container::bordered_box),
+                row![status, Space::new().width(Length::Fill)],
+                check,
+                reference,
+                row![
+                    button(text(t!("Check")).size(11))
+                        .on_press(msg(GraphMsg::ScriptCheck))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    Space::new().width(Length::Fill),
+                    button(text(t!("Cancel")).size(11))
+                        .on_press(msg(GraphMsg::ScriptCancel))
+                        .style(button::secondary)
+                        .padding([4, 10]),
+                    button(text(t!("Apply")).size(11))
+                        .on_press(msg(GraphMsg::ScriptSave))
+                        .style(button::primary)
+                        .padding([4, 10]),
+                ]
+                .spacing(6),
+            ]
+            .spacing(8),
+        )
+        .padding(14)
+        .width(PICKER_TWO_W)
+        .style(card_style);
+        // A click beside the editor checks rather than losing the program.
+        modal(card.into(), GraphMsg::ScriptCheck)
+    }
+
     /// Asks before an edit drops links, naming each one.
     fn confirm_dialog(
         &self,
@@ -4407,7 +4817,10 @@ impl Graph {
                     || Space::new().width(14.0).into(),
                     |bytes| crate::ui::icons::semantic(bytes, 14.0),
                 ),
-            PaletteItem::Op(_) | PaletteItem::Composite(_) => Space::new().width(14.0).into(),
+            PaletteItem::Op(_)
+            | PaletteItem::Composite(_)
+            | PaletteItem::NewScript
+            | PaletteItem::Script(_) => Space::new().width(14.0).into(),
         };
         let entry = button(
             row![icon, text(item.title()).size(12)]
@@ -4438,6 +4851,16 @@ impl Graph {
                     crate::ui::icons::TRASH,
                     "Remove from library",
                     Some(GraphMsg::ForgetComposite(k))
+                )
+            ]
+            .align_y(iced::Center)
+            .into(),
+            PaletteItem::Script(k) => row![
+                entry,
+                icon_button(
+                    crate::ui::icons::TRASH,
+                    "Remove from library",
+                    Some(GraphMsg::ForgetScript(k))
                 )
             ]
             .align_y(iced::Center)
@@ -4488,7 +4911,7 @@ impl Graph {
         let wanted =
             |item: PaletteItem| query.is_empty() || item.title().to_lowercase().contains(&query);
         let mut tree = column![].spacing(1);
-        let categories = ["Objects", "Composites"]
+        let categories = ["Objects", "Composites", "Scripts"]
             .into_iter()
             .chain(graph::CATEGORIES.iter().copied());
         for category in categories {
@@ -4500,6 +4923,10 @@ impl Graph {
             } else if category == "Composites" {
                 (0..composite_library().len())
                     .map(PaletteItem::Composite)
+                    .collect()
+            } else if category == "Scripts" {
+                std::iter::once(PaletteItem::NewScript)
+                    .chain((0..script_library().len()).map(PaletteItem::Script))
                     .collect()
             } else {
                 graph::LIBRARY
@@ -4775,6 +5202,40 @@ impl Graph {
                 }
             }
             GraphMsg::CompositeEditCancel => self.editing = None,
+            GraphMsg::ScriptEdit(id) => self.scripting = self.script_draft(*id),
+            GraphMsg::ScriptName(name) => {
+                if let Some(draft) = &mut self.scripting {
+                    draft.name = name.clone();
+                }
+            }
+            GraphMsg::ScriptAction(action) => {
+                if let Some(draft) = &mut self.scripting {
+                    let edits = action.is_edit();
+                    draft.content.perform(action.clone());
+                    if edits {
+                        draft.checked = None;
+                    }
+                }
+            }
+            GraphMsg::ScriptCheck => {
+                if let Some(draft) = &mut self.scripting {
+                    draft.checked = Some(script_check(&draft.content.text()));
+                }
+            }
+            GraphMsg::ScriptCancel => self.scripting = None,
+            GraphMsg::ForgetScript(k) => forget_script(*k),
+            GraphMsg::TrustScripts => {
+                if let Some(fingerprint) = self.script_fingerprint() {
+                    trust_scripts(fingerprint);
+                }
+                self.scripts_paused = false;
+            }
+            GraphMsg::ScriptSave => {
+                if let Some(draft) = self.scripting.take() {
+                    self.record();
+                    self.apply_script(draft.node, draft.name, draft.content.text());
+                }
+            }
             GraphMsg::CompositeEditSave => {
                 if let Some(draft) = self.editing.take() {
                     self.record();
@@ -5587,6 +6048,50 @@ mod tests {
         assert_eq!(graph.found, Some(wall), "wraps round");
         graph.update_ui(&GraphMsg::NodeSearch("nothing".into()));
         assert_eq!(graph.found, None);
+    }
+
+    #[test]
+    fn script_edits_keep_values_and_links_of_the_ports_they_keep() {
+        let mut graph = Graph::default();
+        let input = graph.add_node(op("Number"), Vec::new());
+        let script = graph.add_node(PaletteItem::NewScript, Vec::new());
+        let after = graph.add_node(op("Negate"), Vec::new());
+        link(&mut graph, port(input, "value"), port(script, "a"));
+        link(&mut graph, port(script, "sum"), port(after, "x"));
+        graph.update_ui(&GraphMsg::ScriptEdit(script));
+        let draft = graph.scripting.as_ref().unwrap();
+        assert!(draft.checked.as_ref().is_some_and(Result::is_ok));
+        // Keep `a` and `sum`; drop `b` and `product`; add `k`.
+        graph.update_ui(&GraphMsg::ScriptName("Scaled".into()));
+        graph.scripting.as_mut().unwrap().content = iced::widget::text_editor::Content::with_text(
+            "// inputs: a: number, k: number = 3\n// outputs: sum: number\na * k",
+        );
+        graph.update_ui(&GraphMsg::ScriptCheck);
+        let checked = graph
+            .scripting
+            .as_ref()
+            .unwrap()
+            .checked
+            .clone()
+            .unwrap()
+            .unwrap();
+        assert!(checked.contains("k (number)"), "{checked}");
+        graph.update_ui(&GraphMsg::ScriptSave);
+        assert!(graph.scripting.is_none());
+        assert!(graph.engine.is_linked(&port(script, "a")));
+        assert!(
+            graph.engine.is_linked(&port(after, "x")),
+            "sum is still there"
+        );
+        let node = graph.engine.node(script).unwrap();
+        assert_eq!(node.params["k"], json!(3));
+        assert!(!node.params.contains_key("b"));
+        assert_eq!(kind_name(&node.kind), "Scaled");
+        graph.update_ui(&GraphMsg::Undo);
+        let Kind::Script(back) = &graph.engine.node(script).unwrap().kind else {
+            panic!()
+        };
+        assert_eq!(back.source, graph::script::TEMPLATE);
     }
 
     #[test]

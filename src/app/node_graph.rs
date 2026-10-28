@@ -287,6 +287,11 @@ impl OpenCADStudio {
         self.push_undo_snapshot(i, "GRAPH");
         self.graph_undo_open = true;
         let mut tasks = edit(self);
+        // A graph whose scripts wait for the user's word stays as saved.
+        if self.tabs[i].graph.scripts_paused {
+            self.graph_undo_open = false;
+            return Task::batch(tasks);
+        }
         let mut engine = std::mem::take(&mut self.tabs[i].graph.engine);
         let mut host = AppHost {
             app: self,
@@ -615,9 +620,14 @@ impl OpenCADStudio {
             }
             GraphMsg::Add(item) => {
                 self.tabs[i].graph.record();
-                self.tabs[i].graph.add_node(item, Vec::new());
+                let id = self.tabs[i].graph.add_node(item, Vec::new());
+                // A new script opens in its editor.
+                if matches!(item, crate::ui::node_graph::PaletteItem::NewScript) {
+                    self.tabs[i].graph.update_ui(&GraphMsg::ScriptEdit(id));
+                }
                 return self.graph_run(i);
             }
+            GraphMsg::ScriptSave => return self.graph_run(i),
             // The canvas already changed the graph; re-evaluate. A move held
             // for confirmation changed nothing yet.
             GraphMsg::Choose(_)
@@ -921,8 +931,35 @@ impl OpenCADStudio {
                         });
                     }
                 }
+                // Scripts of a file run only once the user chose to.
+                graph.scripts_paused = graph.script_fingerprint().is_some_and(|fingerprint| {
+                    !crate::ui::node_graph::scripts_trusted(fingerprint)
+                });
                 self.tabs[i].graph = graph;
+                if self.tabs[i].graph.scripts_paused {
+                    self.command_line.push_info(
+                        crate::t!("The graph holds scripts: press Run scripts to evaluate it")
+                            .as_ref(),
+                    );
+                    self.graph_refresh_preview();
+                    return Task::none();
+                }
                 return self.graph_run(i);
+            }
+            GraphMsg::TrustScripts => return self.graph_run(i),
+            GraphMsg::SaveScript(id) => {
+                let graph = &self.tabs[i].graph;
+                if let Some(Kind::Script(script)) =
+                    graph.engine.node(id).map(|node| node.kind.clone())
+                {
+                    let name = graph.name(id);
+                    crate::ui::node_graph::save_script(graph::script::Script::new(
+                        name.clone(),
+                        script.source.clone(),
+                    ));
+                    self.command_line
+                        .push_output(crate::tf!("{} saved to the script library", name).as_ref());
+                }
             }
             _ => {}
         }
