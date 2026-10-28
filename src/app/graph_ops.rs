@@ -209,7 +209,25 @@ pub(crate) fn node_ports(graph: &Graph, drawing: &dyn Drawing, id: NodeId) -> Ve
             .map(|kind| drawing.fields(kind))
             .unwrap_or_default(),
         Kind::Composite(composite) => composite_ports(composite),
+        Kind::Script(script) => script_ports(script),
     }
+}
+
+/// A script's declared ports.
+pub(crate) fn script_ports(script: &graph::script::Script) -> Vec<Field> {
+    let field = |port: &graph::script::ScriptPort, input: bool| Field {
+        name: port.name.clone(),
+        label: port.name.clone(),
+        input,
+        output: !input,
+        kind: Expect::of_type(port.kind),
+    };
+    script
+        .inputs
+        .iter()
+        .map(|port| field(port, true))
+        .chain(script.outputs.iter().map(|port| field(port, false)))
+        .collect()
 }
 
 /// A composite's exposed ports, typed as the inner ports they stand for.
@@ -959,6 +977,7 @@ fn node_json(
         Kind::Op(_) => "builtin",
         Kind::Object(_) => "object",
         Kind::Composite(_) => "composite",
+        Kind::Script(_) => "script",
     };
     let mut value = json!({
         "id": node.id,
@@ -967,6 +986,7 @@ fn node_json(
             Kind::Op(spec) => spec.name.to_owned(),
             Kind::Object(name) => name.clone(),
             Kind::Composite(composite) => composite.name.clone(),
+            Kind::Script(script) => script.name.clone(),
         },
         "source": source,
         "position": position,

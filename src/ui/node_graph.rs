@@ -15,6 +15,7 @@ use codec::{EntityType, Handle};
 use std::sync::Arc;
 
 use graph::docs::{PortType, Type};
+use graph::script::Script;
 use graph::{Composite, Kind, Link, NodeId, Port, Spec};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::widget::{self, Widget};
@@ -469,8 +470,18 @@ pub(crate) fn port_type(kind: &Kind, field: &str, input: bool) -> Option<PortTyp
         Kind::Op(spec) if input => graph::docs::input_type(spec, field),
         Kind::Op(spec) => graph::docs::output_type(spec, field),
         Kind::Composite(composite) => composite_type(composite, field, input),
+        Kind::Script(script) => script_type(script, field, input),
         Kind::Object(_) => None,
     }
+}
+
+/// The kind a script's header declares for port `field`.
+pub(crate) fn script_type(script: &Script, field: &str, input: bool) -> Option<PortType> {
+    let ports = if input { &script.inputs } else { &script.outputs };
+    ports
+        .iter()
+        .find(|port| port.name == field)
+        .map(|port| port.kind)
 }
 
 pub(crate) fn composite_type(composite: &Composite, field: &str, input: bool) -> Option<PortType> {
@@ -492,6 +503,10 @@ pub(crate) fn describe(kind: &Kind) -> String {
         Kind::Object(name) => ObjectKind::from_name(name)
             .map(|kind| t!(kind.description()).into_owned())
             .unwrap_or_default(),
+        Kind::Script(_) => t!(
+            "A script: a short program computes its outputs from its inputs. Edit it to change its ports or what it does."
+        )
+        .into_owned(),
         Kind::Composite(composite) => {
             let made_of = crate::tf!(
                 "A composite of {} steps used as one node. Expand it to see or change them.",
@@ -724,6 +739,7 @@ pub(crate) fn issue_text(issue: &graph::Issue) -> String {
         graph::Issue::NoResult => t!("No result with these values").into_owned(),
         graph::Issue::Inner(step, issue) => format!("{}: {}", t!(step.as_str()), issue_text(issue)),
         graph::Issue::Formula(why) => crate::tf!("The formula does not read: {}", why).into_owned(),
+        graph::Issue::Script(why) => crate::tf!("Script: {}", why).into_owned(),
     }
 }
 
@@ -1261,6 +1277,7 @@ pub(crate) fn kind_name(kind: &Kind) -> String {
         Kind::Op(spec) => t!(spec.name).into_owned(),
         Kind::Object(name) => t!(name.as_str()).into_owned(),
         Kind::Composite(composite) => composite.name.clone(),
+        Kind::Script(script) => script.name.clone(),
     }
 }
 
@@ -1349,6 +1366,7 @@ fn kind_tag(kind: &Kind) -> String {
         Kind::Op(spec) => t!(spec.category).into_owned(),
         Kind::Object(_) => t!("Object").into_owned(),
         Kind::Composite(_) => t!("Composite").into_owned(),
+        Kind::Script(_) => t!("Script").into_owned(),
     }
 }
 
@@ -2616,6 +2634,7 @@ impl Graph {
                 Kind::Op(spec) => self.op_sections(node.id, spec),
                 Kind::Object(_) => objects.remove(&node.id).unwrap_or_default(),
                 Kind::Composite(ref composite) => self.composite_sections(node.id, composite),
+                Kind::Script(ref script) => self.script_sections(node.id, script),
             })
             .collect()
     }
@@ -2645,6 +2664,38 @@ impl Graph {
             output: true,
             widget: RowWidget::Field,
             kind: port_type(&node.kind, name, false),
+        });
+        vec![NodeSection {
+            title: String::new(),
+            rows: inputs.chain(outputs).collect(),
+        }]
+    }
+
+    /// A script's rows: the inputs and outputs its header declares.
+    fn script_sections(&self, id: NodeId, script: &Script) -> Vec<NodeSection> {
+        let Some(node) = self.engine.node(id) else {
+            return Vec::new();
+        };
+        let inputs = script.inputs.iter().map(|port| NodeRow {
+            field: port.name.clone(),
+            label: port.name.clone(),
+            value: self.engine.input(&Port {
+                node: id,
+                field: port.name.clone(),
+            }),
+            input: true,
+            output: false,
+            widget: RowWidget::Field,
+            kind: Some(port.kind),
+        });
+        let outputs = script.outputs.iter().map(|port| NodeRow {
+            field: port.name.clone(),
+            label: port.name.clone(),
+            value: node.outputs.get(&port.name).cloned().unwrap_or(Value::Null),
+            input: false,
+            output: true,
+            widget: RowWidget::Field,
+            kind: Some(port.kind),
         });
         vec![NodeSection {
             title: String::new(),
@@ -2702,6 +2753,8 @@ impl Graph {
         match self.engine.node(target.node).map(|node| &node.kind) {
             Some(Kind::Op(spec)) => spec_expect(spec, &target.field),
             Some(Kind::Composite(composite)) => composite_expect(composite, &target.field),
+            Some(Kind::Script(script)) => script_type(script, &target.field, true)
+                .map_or(Expect::Any, Expect::of_type),
             Some(Kind::Object(_)) => Expect::of_value(value),
             None => Expect::Any,
         }

@@ -119,7 +119,7 @@ pub fn ui_name_or_class(e: &EntityType) -> String {
                     let mut c = w.chars();
                     match c.next() {
                         Some(f) => {
-                            f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase()
+                            f.to_uppercase().collect::<String>() + c.as_str().to_lowercase().as_str()
                         }
                         None => String::new(),
                     }

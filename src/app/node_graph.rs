@@ -910,7 +910,7 @@ impl OpenCADStudio {
                 for node in &graph.engine.nodes {
                     let kind = match &node.kind {
                         Kind::Object(name) => ObjectKind::from_name(name),
-                        Kind::Op(_) | Kind::Composite(_) => None,
+                        Kind::Op(_) | Kind::Composite(_) | Kind::Script(_) => None,
                     };
                     if let Some(ui) = graph.ui.get_mut(&node.id) {
                         ui.handles.retain(|handle| {
@@ -1669,7 +1669,7 @@ fn preview_wires(
             PREVIEW_COLOR
         };
         match node.kind {
-            Kind::Op(_) | Kind::Composite(_) => {
+            Kind::Op(_) | Kind::Composite(_) | Kind::Script(_) => {
                 let mut curves = Vec::new();
                 node.outputs
                     .values()

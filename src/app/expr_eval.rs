@@ -757,7 +757,7 @@ mod tests {
 
     #[test]
     fn deeply_nested_parens_returns_none() {
-        let expr = "(".repeat(1000) + "1" + &")".repeat(1000);
+        let expr = "(".repeat(1000) + "1" + ")".repeat(1000).as_str();
         assert_eq!(
             eval_number(&expr),
             None,
@@ -767,7 +767,7 @@ mod tests {
 
     #[test]
     fn moderately_nested_parens_still_evaluate() {
-        let expr = "(".repeat(30) + "1" + &")".repeat(30);
+        let expr = "(".repeat(30) + "1" + ")".repeat(30).as_str();
         assert_eq!(
             eval_number(&expr),
             Some(1.0),
@@ -780,8 +780,8 @@ mod tests {
         // ~6 parser frames per paren level → 41 accepted, 42 rejected. Pinned so
         // a refactor that changes the method-chain length can't silently shift
         // the real depth limit without a failing test.
-        let ok = "(".repeat(41) + "1" + &")".repeat(41);
-        let over = "(".repeat(42) + "1" + &")".repeat(42);
+        let ok = "(".repeat(41) + "1" + ")".repeat(41).as_str();
+        let over = "(".repeat(42) + "1" + ")".repeat(42).as_str();
         assert_eq!(eval_number(&ok), Some(1.0), "41 levels must still evaluate");
         assert_eq!(eval_number(&over), None, "42 levels must be rejected");
     }
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn deep_function_arg_nesting_is_rejected_not_overflow() {
         // parse_atom → parse_args → parse_expr is the third recursion entry.
-        let expr = "abs(".repeat(100_000) + "1" + &")".repeat(100_000);
+        let expr = "abs(".repeat(100_000) + "1" + ")".repeat(100_000).as_str();
         assert_eq!(eval_number(&expr), None);
     }
 
@@ -810,7 +810,7 @@ mod tests {
         assert_eq!(eval_to_string(&junk), junk);
         // Nested parens (the class the depth guard targets) routed through the
         // production entry point must also return promptly, not hang.
-        let nested = "(".repeat(50_000) + "1" + &")".repeat(50_000);
+        let nested = "(".repeat(50_000) + "1" + ")".repeat(50_000).as_str();
         assert_eq!(eval_to_string(&nested), nested);
     }
 }
