@@ -55,6 +55,9 @@ pub const NODE_SEARCH_ID: &str = "node-graph-node-search";
 /// found node can be brought into view.
 pub const SEQUENCE_SCROLL_ID: &str = "node-graph-sequence";
 pub const INPUTS_SCROLL_ID: &str = "node-graph-inputs";
+/// A node with the rows its card shows.
+type Card<'n> = (&'n graph::Node, Vec<NodeSection>);
+
 /// The scrollable of sequence `id`'s steps.
 pub fn sequence_scroll_id(id: SequenceId) -> String {
     format!("node-graph-sequence-{id}")
@@ -4053,11 +4056,8 @@ impl Graph {
 
     /// Splits nodes into runs of consecutive members of one group (or of
     /// none).
-    fn runs<'n>(
-        &self,
-        nodes: Vec<(&'n graph::Node, Vec<NodeSection>)>,
-    ) -> Vec<(Option<&NodeGroup>, Vec<(&'n graph::Node, Vec<NodeSection>)>)> {
-        let mut runs: Vec<(Option<GroupId>, Vec<(&'n graph::Node, Vec<NodeSection>)>)> = Vec::new();
+    fn runs<'n>(&self, nodes: Vec<Card<'n>>) -> Vec<(Option<&NodeGroup>, Vec<Card<'n>>)> {
+        let mut runs: Vec<(Option<GroupId>, Vec<Card<'n>>)> = Vec::new();
         for (node, node_sections) in nodes {
             let group = self.node_group(node.id);
             match runs.last_mut() {
@@ -5819,7 +5819,7 @@ impl Graph {
             ]
             .align_y(iced::Center)
             .into(),
-            _ => entry.into(),
+            _ => entry,
         }
     }
 
@@ -5963,7 +5963,7 @@ impl Graph {
                     .gap(2),
                 )
             } else {
-                heading.into()
+                heading
             });
             if open {
                 for item in items {

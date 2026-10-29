@@ -7311,11 +7311,6 @@ node-help =
     .list-items = __ocs_fmt_0__ items
     .composite-edit = Edit composite
     .composite-edit-note = Links follow renamed ports. Save the composite to the library to keep the changes for other drawings.
-    .library-export = Export the composite library
-    .library-import = Import composites
-    .library-imported = __ocs_fmt_0__ composites added to the library
-    .library-invalid = Not a composite library: __ocs_fmt_0__
-    .library-exported = Composite library exported to __ocs_fmt_0__
     .object-aligned-dimension = Aligned Dimension
     .op-expression = Evaluates a formula of a, b, c, d, x and y with + - * / % ^, comparisons (< <= > >= == !=), and, or, not, c ? a : b, and functions such as sqrt, sin, min, max, round, clamp or if. Comparisons give true or false.
     .op-filter = Splits a list by a condition such as x > 2 and i % 2 == 0: x is the item (a curve's length), px, py and pz a point's coordinates, i the index and n the count. Gives the items that pass, the rest and the indices of those that pass.

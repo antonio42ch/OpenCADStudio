@@ -7312,11 +7312,6 @@ node-help =
     .list-items = __ocs_fmt_0__ elementos
     .composite-edit = Editar compuesto
     .composite-edit-note = Los enlaces siguen a los puertos renombrados. Guarda el compuesto en la biblioteca para conservar los cambios en otros dibujos.
-    .library-export = Exportar la biblioteca de compuestos
-    .library-import = Importar compuestos
-    .library-imported = __ocs_fmt_0__ compuestos añadidos a la biblioteca
-    .library-invalid = No es una biblioteca de compuestos: __ocs_fmt_0__
-    .library-exported = Biblioteca de compuestos exportada a __ocs_fmt_0__
     .object-aligned-dimension = Cota alineada
     .op-expression = Evalúa una fórmula de a, b, c, d, x e y con + - * / % ^, comparaciones (< <= > >= == !=), and, or, not, c ? a : b y funciones como sqrt, sin, min, max, round, clamp o if. Las comparaciones dan verdadero o falso.
     .op-filter = Separa una lista según una condición como x > 2 and i % 2 == 0: x es el elemento (la longitud si es una curva), px, py y pz las coordenadas de un punto, i el índice y n la cantidad. Da los elementos que cumplen, el resto y los índices de los que cumplen.
