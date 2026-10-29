@@ -1,0 +1,87 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<!-- Installer for builds of the antonio42ch fork: its own product, so it
+     installs beside an official Open CAD Studio without touching it. It
+     registers no file types and no thumbnail handler; those stay with the
+     official installation. -->
+<Wix xmlns='http://schemas.microsoft.com/wix/2006/wi'>
+  <Product
+    Id='*'
+    Name='Open CAD Studio Nodes'
+    UpgradeCode='f850e779-b9b2-4706-8f5e-300b0fff47b8'
+    Manufacturer='antonio42ch'
+    Language='1033'
+    Codepage='1252'
+    Version='$(var.Version)'>
+
+    <Package
+      Id='*'
+      Description='Open CAD Studio with the node sequence graph (fork build)'
+      Manufacturer='antonio42ch'
+      InstallerVersion='450'
+      Languages='1033'
+      Compressed='yes'
+      InstallScope='perUser'
+      InstallPrivileges='limited'
+      SummaryCodepage='1252' />
+
+    <MajorUpgrade
+      AllowSameVersionUpgrades='yes'
+      DowngradeErrorMessage='A newer Open CAD Studio Nodes is already installed.' />
+
+    <Media Id='1' Cabinet='product.cab' EmbedCab='yes' />
+
+    <Icon Id='AppIcon.ico' SourceFile='$(var.Icon)' />
+    <Property Id='ARPPRODUCTICON' Value='AppIcon.ico' />
+    <Property Id='ARPURLINFOABOUT' Value='https://github.com/antonio42ch/OpenCADStudio' />
+    <Property Id='ARPNOREPAIR' Value='1' />
+    <Property Id='ARPNOMODIFY' Value='1' />
+    <Property Id='WIXUI_INSTALLDIR' Value='APPLICATIONROOTDIRECTORY' />
+    <WixVariable Id='WixUILicenseRtf' Value='$(var.License)' />
+
+    <Directory Id='TARGETDIR' Name='SourceDir'>
+      <Directory Id='LocalAppDataFolder'>
+        <Directory Id='ProgramsFolder' Name='Programs'>
+          <Directory Id='APPLICATIONROOTDIRECTORY' Name='Open CAD Studio Nodes' />
+        </Directory>
+      </Directory>
+      <Directory Id='ProgramMenuFolder'>
+        <Directory Id='ProgramMenuDir' Name='Open CAD Studio Nodes' />
+      </Directory>
+      <Directory Id='DesktopFolder' Name='Desktop' />
+    </Directory>
+
+    <DirectoryRef Id='APPLICATIONROOTDIRECTORY'>
+      <Component Id='MainExecutable' Guid='60ed250f-628f-4e15-8b84-07a155993312'>
+        <File Id='OpenCADStudioEXE' Name='OpenCADStudio.exe' DiskId='1' Source='$(var.Source)' />
+        <RegistryValue Root='HKCU' Key='Software\antonio42ch\OpenCADStudioNodes' Name='installed' Type='integer' Value='1' KeyPath='yes' />
+        <RemoveFolder Id='RemoveAppFolder' Directory='APPLICATIONROOTDIRECTORY' On='uninstall' />
+        <RemoveFolder Id='RemoveProgramsFolder' Directory='ProgramsFolder' On='uninstall' />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id='ProgramMenuDir'>
+      <Component Id='StartMenuShortcut' Guid='ea5cbc0d-9f8f-45e3-9668-863cc2e37fd2'>
+        <Shortcut Id='StartMenuLink' Name='Open CAD Studio Nodes' Target='[#OpenCADStudioEXE]'
+                  WorkingDirectory='APPLICATIONROOTDIRECTORY' Icon='AppIcon.ico' />
+        <RemoveFolder Id='RemoveProgramMenuDir' On='uninstall' />
+        <RegistryValue Root='HKCU' Key='Software\antonio42ch\OpenCADStudioNodes' Name='startmenu' Type='integer' Value='1' KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <DirectoryRef Id='DesktopFolder'>
+      <Component Id='DesktopShortcut' Guid='70514602-fbdb-4db5-b05f-ef8ec4558ea6'>
+        <Shortcut Id='DesktopLink' Name='Open CAD Studio Nodes' Target='[#OpenCADStudioEXE]'
+                  WorkingDirectory='APPLICATIONROOTDIRECTORY' Icon='AppIcon.ico' />
+        <RegistryValue Root='HKCU' Key='Software\antonio42ch\OpenCADStudioNodes' Name='desktop' Type='integer' Value='1' KeyPath='yes' />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id='Complete' Level='1'>
+      <ComponentRef Id='MainExecutable' />
+      <ComponentRef Id='StartMenuShortcut' />
+      <ComponentRef Id='DesktopShortcut' />
+    </Feature>
+
+    <UIRef Id='WixUI_InstallDir' />
+  </Product>
+</Wix>

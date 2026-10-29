@@ -1,5 +1,7 @@
-# Builds OpenCADStudio.exe for Windows from this branch and keeps it as a
-# downloadable artifact. Runs on every push to build/windows, or by hand.
+# Builds OpenCADStudio.exe for Windows from this branch, and an installer
+# (packaging/windows/fork.wxs) that installs it beside an official Open CAD
+# Studio. Both are kept as downloadable artifacts. Runs on every push to
+# build/windows, or by hand.
 name: Windows build
 
 on:
@@ -28,7 +30,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Application icon
-        continue-on-error: true
         shell: pwsh
         run: |
           magick assets/logo.svg `
@@ -39,9 +40,35 @@ jobs:
         shell: bash
         run: cargo build --locked --release
 
-      - name: Upload
+      - name: Installer
+        shell: pwsh
+        run: |
+          # MSI versions run to 255 in their first part: 2026.42.0 -> 26.42.<run>.
+          $cargo = (Select-String -Path Cargo.toml -Pattern '^version = "(\d+)\.(\d+)').Matches[0].Groups
+          $version = "{0}.{1}.{2}" -f ([int]$cargo[1].Value - 2000), $cargo[2].Value, $env:GITHUB_RUN_NUMBER
+          $candle = Join-Path $env:WIX "bin\candle.exe"
+          $light  = Join-Path $env:WIX "bin\light.exe"
+          $icon = if (Test-Path packaging\windows\AppIcon.ico) { "packaging\windows\AppIcon.ico" } else { throw "no icon" }
+          & $candle -arch x64 "-dVersion=$version" `
+            "-dSource=$((Resolve-Path target\release\OpenCADStudio.exe).Path)" `
+            "-dIcon=$((Resolve-Path $icon).Path)" `
+            "-dLicense=$((Resolve-Path packaging\windows\License.rtf).Path)" `
+            packaging\windows\fork.wxs -out packaging\windows\fork.wixobj
+          if ($LASTEXITCODE -ne 0) { throw "candle failed" }
+          & $light packaging\windows\fork.wixobj -ext WixUIExtension -cultures:en-us `
+            -out OpenCADStudioNodes-setup.msi
+          if ($LASTEXITCODE -ne 0) { throw "light failed" }
+
+      - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
-          name: OpenCADStudio-windows
+          name: OpenCADStudio-windows-installer
+          path: OpenCADStudioNodes-setup.msi
+          retention-days: 30
+
+      - name: Upload portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCADStudio-windows-portable
           path: target/release/OpenCADStudio.exe
           retention-days: 30
