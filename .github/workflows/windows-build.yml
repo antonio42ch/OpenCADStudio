@@ -1,0 +1,47 @@
+# Builds OpenCADStudio.exe for Windows from this branch and keeps it as a
+# downloadable artifact. Runs on every push to build/windows, or by hand.
+name: Windows build
+
+on:
+  push:
+    branches: [build/windows]
+  workflow_dispatch:
+
+env:
+  # As in release.yml: rustc needs a deeper stack for this crate.
+  RUST_MIN_STACK: "67108864"
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # build.rs labels the version from the history.
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Application icon
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          magick assets/logo.svg `
+            -define icon:auto-resize=16,24,32,48,64,128,256 `
+            packaging/windows/AppIcon.ico
+
+      - name: Build
+        shell: bash
+        run: cargo build --locked --release
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenCADStudio-windows
+          path: target/release/OpenCADStudio.exe
+          retention-days: 30
