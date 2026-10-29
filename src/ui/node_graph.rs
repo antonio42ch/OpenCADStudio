@@ -55,6 +55,11 @@ pub const NODE_SEARCH_ID: &str = "node-graph-node-search";
 /// found node can be brought into view.
 pub const SEQUENCE_SCROLL_ID: &str = "node-graph-sequence";
 pub const INPUTS_SCROLL_ID: &str = "node-graph-inputs";
+/// The scrollable of sequence `id`'s steps.
+pub fn sequence_scroll_id(id: SequenceId) -> String {
+    format!("node-graph-sequence-{id}")
+}
+
 /// Width of a step in the compact view.
 const COMPACT_W: f32 = 200.0;
 /// Section key of a slider's range rows.
@@ -2479,20 +2484,28 @@ impl Graph {
         self.hovered = self.found;
     }
 
-    /// Where the found node sits: whether it is an input, and how far along
-    /// its area it is, from 0 (first) to 1 (last).
-    pub fn found_place(&self) -> Option<(bool, f32)> {
+    /// Where the found node sits: its sequence (`None` for an input), and
+    /// how far along its area it is, from 0 (first) to 1 (last).
+    pub fn found_place(&self) -> Option<(Option<SequenceId>, f32)> {
         let id = self.found?;
-        let input = is_input(&self.engine.node(id)?.kind);
+        let sequence = self.node_sequence(id);
         let area: Vec<NodeId> = self
             .engine
             .nodes
             .iter()
-            .filter(|node| is_input(&node.kind) == input)
+            .filter(|node| self.node_sequence(node.id) == sequence)
             .map(|node| node.id)
             .collect();
         let k = area.iter().position(|other| *other == id)?;
-        Some((input, k as f32 / (area.len().max(2) - 1) as f32))
+        Some((sequence, k as f32 / (area.len().max(2) - 1) as f32))
+    }
+
+    /// How far down the found step's sequence is among the sequences, from
+    /// 0 to 1.
+    pub fn found_lane(&self, sequence: SequenceId) -> f32 {
+        let list = self.sequence_list();
+        let k = list.iter().position(|s| s.id == sequence).unwrap_or(0);
+        k as f32 / (list.len().max(2) - 1) as f32
     }
 
     /// Nodes `ids` as clipboard text: the nodes, the links among them, their
@@ -3723,35 +3736,53 @@ impl Graph {
                         None => run.into(),
                     });
                 }
-                lane = lane.push(track);
+                // Each sequence scrolls sideways on its own.
+                lane = lane.push(
+                    scrollable(
+                        container(Scaled {
+                            content: track.into(),
+                            zoom: self.zoom(),
+                        })
+                        .padding(iced::Padding {
+                            top: 0.0,
+                            right: 0.0,
+                            bottom: 10.0,
+                            left: 0.0,
+                        }),
+                    )
+                    .id(iced::widget::Id::from(sequence_scroll_id(sequence.id)))
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::default(),
+                    ))
+                    .width(Length::Fill),
+                );
             }
             let active = several && sequence.id == self.active();
-            lanes = lanes.push(container(lane).padding(if several { 6 } else { 0 }).style(
-                move |theme: &Theme| {
-                    if !several {
-                        return container::Style::default();
-                    }
-                    let palette = theme.palette();
-                    container::Style {
-                        border: Border {
-                            color: if active {
-                                palette.primary.base.color
-                            } else {
-                                palette.background.strong.color
+            lanes = lanes.push(
+                container(lane)
+                    .width(Length::Fill)
+                    .padding(if several { 6 } else { 0 })
+                    .style(move |theme: &Theme| {
+                        if !several {
+                            return container::Style::default();
+                        }
+                        let palette = theme.palette();
+                        container::Style {
+                            border: Border {
+                                color: if active {
+                                    palette.primary.base.color
+                                } else {
+                                    palette.background.strong.color
+                                },
+                                width: if active { 1.5 } else { 1.0 },
+                                radius: 8.0.into(),
                             },
-                            width: if active { 1.5 } else { 1.0 },
-                            radius: 8.0.into(),
-                        },
-                        ..Default::default()
-                    }
-                },
-            ));
+                            ..Default::default()
+                        }
+                    }),
+            );
         }
-        let sequence_body: Element<'_, Message> = Scaled {
-            content: lanes.into(),
-            zoom: self.zoom(),
-        }
-        .into();
+        let sequence_body: Element<'_, Message> = lanes.into();
         let zoom_button = |icon: &'static [u8], tip: &str, steps: i32, enabled: bool| {
             icon_button(icon, tip, enabled.then_some(GraphMsg::Zoom(steps)))
         };
@@ -3949,14 +3980,11 @@ impl Graph {
                 bottom: 4.0,
                 left: 0.0,
             }))
+            // The sequences, one under another, scroll up and down together;
+            // each scrolls sideways on its own.
             .id(iced::widget::Id::new(SEQUENCE_SCROLL_ID))
-            .direction(scrollable::Direction::Both {
-                vertical: scrollable::Scrollbar::default(),
-                horizontal: scrollable::Scrollbar::default(),
-            })
             .width(Length::Fill)
-            // As tall as the nodes, up to the space there is, so the
-            // horizontal scrollbar sits right under them.
+            // As tall as the sequences, up to the space there is.
             .height(Length::Shrink),
         ]
         .spacing(8)
@@ -7061,10 +7089,10 @@ mod tests {
         graph.update_ui(&GraphMsg::NodeSearch("add".into()));
         assert_eq!(graph.search_matches(), vec![wall, wall_two]);
         assert_eq!(graph.found, Some(wall));
-        assert_eq!(graph.found_place(), Some((false, 0.0)));
+        assert_eq!(graph.found_place(), Some((Some(1), 0.0)));
         graph.update_ui(&GraphMsg::NodeSearchStep(1));
         assert_eq!(graph.found, Some(wall_two));
-        assert_eq!(graph.found_place(), Some((false, 1.0)));
+        assert_eq!(graph.found_place(), Some((Some(1), 1.0)));
         assert!(!graph.group(group).unwrap().collapsed, "its group opens");
         graph.update_ui(&GraphMsg::NodeSearchStep(1));
         assert_eq!(graph.found, Some(wall), "wraps round");

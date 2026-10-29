@@ -644,27 +644,38 @@ impl OpenCADStudio {
             GraphMsg::ToggleSlider(_) => return self.graph_run(i),
             GraphMsg::NodeSearch(_) | GraphMsg::NodeSearchStep(_) => {
                 self.graph_refresh_preview();
-                let Some((input, along)) = self.tabs[i].graph.found_place() else {
+                let Some((sequence, along)) = self.tabs[i].graph.found_place() else {
                     return Task::none();
                 };
-                let (id, offset) = if input {
-                    (
-                        crate::ui::node_graph::INPUTS_SCROLL_ID,
-                        iced::widget::scrollable::RelativeOffset {
+                use iced::widget::scrollable::RelativeOffset;
+                return match sequence {
+                    None => iced::widget::operation::snap_to(
+                        iced::widget::Id::new(crate::ui::node_graph::INPUTS_SCROLL_ID),
+                        RelativeOffset {
                             x: None,
                             y: Some(along),
                         },
-                    )
-                } else {
-                    (
-                        crate::ui::node_graph::SEQUENCE_SCROLL_ID,
-                        iced::widget::scrollable::RelativeOffset {
-                            x: Some(along),
-                            y: None,
-                        },
-                    )
+                    ),
+                    // Down to its sequence, then along it.
+                    Some(sequence) => Task::batch([
+                        iced::widget::operation::snap_to(
+                            iced::widget::Id::new(crate::ui::node_graph::SEQUENCE_SCROLL_ID),
+                            RelativeOffset {
+                                x: None,
+                                y: Some(self.tabs[i].graph.found_lane(sequence)),
+                            },
+                        ),
+                        iced::widget::operation::snap_to(
+                            iced::widget::Id::from(crate::ui::node_graph::sequence_scroll_id(
+                                sequence,
+                            )),
+                            RelativeOffset {
+                                x: Some(along),
+                                y: None,
+                            },
+                        ),
+                    ]),
                 };
-                return iced::widget::operation::snap_to(iced::widget::Id::new(id), offset);
             }
             GraphMsg::CopyNodes(ids) => {
                 if ids.is_empty() {
